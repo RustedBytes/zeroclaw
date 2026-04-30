@@ -35,9 +35,16 @@
     unused_imports
 )]
 
-#[cfg(feature = "mimalloc-allocator")]
+#[cfg(all(feature = "mimalloc-allocator", not(feature = "jemalloc-allocator")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "jemalloc-allocator", not(feature = "mimalloc-allocator")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "mimalloc-allocator", feature = "jemalloc-allocator"))]
+compile_error!("mimalloc-allocator and jemalloc-allocator cannot be enabled together");
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};

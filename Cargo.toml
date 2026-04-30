@@ -163,6 +163,7 @@ parking_lot = "0.12"
 
 # Optional allocator for profiling and long-running runtime deployments.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
 
 # Async traits
 async-trait = "0.1"
@@ -275,6 +276,7 @@ gateway = [
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
 mimalloc-allocator = ["dep:mimalloc"]
+jemalloc-allocator = ["dep:tikv-jemallocator"]
 
 # Channels — each forwards directly to zeroclaw-channels (1 hop)
 channel-email = ["zeroclaw-channels/channel-email"]
