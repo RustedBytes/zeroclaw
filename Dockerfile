@@ -82,9 +82,12 @@ RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
+    rm -rf target/release/.fingerprint \
+           target/release/deps \
+           target/release/incremental \
+           target/release/build \
+           target/release/zeroclaw \
+           target/release/zeroclaw.d && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
