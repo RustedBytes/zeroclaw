@@ -23,22 +23,42 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Copy every workspace-member manifest in one glob — adding or removing a crate
-# no longer requires editing this file.  --parents preserves the
-# crates/<name>/Cargo.toml directory structure.
+# Copy every workspace-member manifest explicitly. `COPY --parents` is not
+# available in the stable Dockerfile frontend used by some Docker installs.
 # aardvark-sys has an implicit build script (build.rs at its crate root) that
 # Cargo must compile during the dependency pre-fetch step; copy it explicitly.
-COPY --parents crates/*/Cargo.toml ./
-COPY --parents crates/aardvark-sys/build.rs ./
+COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
+COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
+COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
+COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
+COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
+COPY crates/zeroclaw-infra/Cargo.toml crates/zeroclaw-infra/Cargo.toml
+COPY crates/zeroclaw-macros/Cargo.toml crates/zeroclaw-macros/Cargo.toml
+COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
+COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
+COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
+COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
+COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
+COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
+COPY crates/zeroclaw-tui/Cargo.toml crates/zeroclaw-tui/Cargo.toml
+COPY crates/aardvark-sys/build.rs crates/aardvark-sys/build.rs
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create dummy targets for all workspace members so manifest parsing succeeds.
-RUN mkdir -p src benches apps/tauri/src \
+RUN mkdir -p src benches apps/tauri/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/tauri/build.rs \
+    && echo "fn main() {}" > tools/fill-translations/src/main.rs \
+    && echo "" > xtask/src/lib.rs \
+    && echo "fn main() {}" > xtask/src/bin/fluent.rs \
+    && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -51,6 +71,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN rm -rf src benches
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+COPY crates/ crates/
+COPY tools/ tools/
+COPY xtask/ xtask/
 COPY src/ src/
 COPY benches/ benches/
 COPY *.rs .
