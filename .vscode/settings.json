@@ -18,5 +18,6 @@
   "rust-analyzer.check.extraArgs": ["--all-targets", "--", "-D", "warnings"],
   "window.title": "${activeRepositoryBranchName}",
   "coverage-gutters.coverageFileNames": ["lcov.info"],
-  "git.postCommitCommand": "push"
+  "git.postCommitCommand": "push",
+  "qualirs.paused": true
 }
