@@ -8,6 +8,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use zeroclaw_config::schema::AutonomyConfig;
 
@@ -224,20 +225,21 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
-                        other => {
-                            let s = other.to_string();
-                            truncate_for_summary(&s, 80)
-                        }
-                    };
-                    format!("{k}: {val}")
-                })
-                .collect();
-            parts.join(", ")
+            let mut summary = String::new();
+            for (idx, (k, v)) in map.iter().enumerate() {
+                if idx > 0 {
+                    summary.push_str(", ");
+                }
+                let _ = write!(summary, "{k}: ");
+                match v {
+                    serde_json::Value::String(s) => push_truncated(&mut summary, s, 80),
+                    other => {
+                        let s = other.to_string();
+                        push_truncated(&mut summary, &s, 80);
+                    }
+                }
+            }
+            summary
         }
         other => {
             let s = other.to_string();
@@ -247,12 +249,16 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
 }
 
 fn truncate_for_summary(input: &str, max_chars: usize) -> String {
+    let mut output = String::with_capacity(input.len().min(max_chars + 3));
+    push_truncated(&mut output, input, max_chars);
+    output
+}
+
+fn push_truncated(output: &mut String, input: &str, max_chars: usize) {
     let mut chars = input.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
+    output.extend(chars.by_ref().take(max_chars));
     if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        input.to_string()
+        output.push('…');
     }
 }
 

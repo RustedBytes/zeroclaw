@@ -161,6 +161,9 @@ portable-atomic = "1"
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
+# Optional allocator for profiling and long-running runtime deployments.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
 # Async traits
 async-trait = "0.1"
 
@@ -271,6 +274,7 @@ gateway = [
 ]
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
+mimalloc-allocator = ["dep:mimalloc"]
 
 # Channels — each forwards directly to zeroclaw-channels (1 hop)
 channel-email = ["zeroclaw-channels/channel-email"]

@@ -78,12 +78,12 @@ fn parse_tool_call_id(
 pub fn canonicalize_json_for_tool_signature(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
+            let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_unstable();
             let mut ordered = serde_json::Map::new();
             for key in keys {
-                if let Some(child) = map.get(&key) {
-                    ordered.insert(key, canonicalize_json_for_tool_signature(child));
+                if let Some(child) = map.get(key) {
+                    ordered.insert(key.clone(), canonicalize_json_for_tool_signature(child));
                 }
             }
             serde_json::Value::Object(ordered)
@@ -293,6 +293,10 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
 
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
 fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+    if !response.contains("<invoke") {
+        return None;
+    }
+
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut last_end = 0usize;
@@ -469,10 +473,11 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
         return values;
     }
 
-    let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
-    let mut idx = 0;
-    while idx < char_positions.len() {
-        let (byte_idx, ch) = char_positions[idx];
+    let mut byte_idx = 0;
+    while byte_idx < trimmed.len() {
+        let Some(ch) = trimmed[byte_idx..].chars().next() else {
+            break;
+        };
         if ch == '{' || ch == '[' {
             let slice = &trimmed[byte_idx..];
             let mut stream =
@@ -481,15 +486,12 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
                 let consumed = stream.byte_offset();
                 if consumed > 0 {
                     values.push(value);
-                    let next_byte = byte_idx + consumed;
-                    while idx < char_positions.len() && char_positions[idx].0 < next_byte {
-                        idx += 1;
-                    }
+                    byte_idx += consumed;
                     continue;
                 }
             }
         }
-        idx += 1;
+        byte_idx += ch.len_utf8();
     }
 
     values
@@ -1430,6 +1432,10 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 /// response text using `<think>` tags.  These must be removed before parsing
 /// tool-call tags or displaying output.
 pub fn strip_think_tags(s: &str) -> String {
+    if !s.contains("<think>") {
+        return s.trim().to_owned();
+    }
+
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     loop {
@@ -1446,7 +1452,11 @@ pub fn strip_think_tags(s: &str) -> String {
             break;
         }
     }
-    result.trim().to_string()
+
+    let trimmed_len = result.trim_end().len();
+    result.truncate(trimmed_len);
+    result.drain(..result.len() - result.trim_start().len());
+    result
 }
 
 /// Strip prompt-guided tool artifacts from visible output while preserving

@@ -405,17 +405,21 @@ fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), Plu
 
 fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(), PluginError> {
     let content = std::fs::read_to_string(skill_md)?;
-    let normalized = content.replace("\r\n", "\n");
-    let rest = normalized.strip_prefix("---\n").ok_or_else(|| {
+    let rest = strip_frontmatter_start(&content).ok_or_else(|| {
         PluginError::InvalidManifest(format!(
             "skill plugin '{}': {} is missing YAML frontmatter",
             plugin_name,
             skill_md.display()
         ))
     })?;
+
     let frontmatter = if let Some(idx) = rest.find("\n---\n") {
         &rest[..idx]
     } else if let Some(stripped) = rest.strip_suffix("\n---") {
+        stripped
+    } else if let Some(idx) = rest.find("\r\n---\r\n") {
+        &rest[..idx]
+    } else if let Some(stripped) = rest.strip_suffix("\r\n---") {
         stripped
     } else {
         return Err(PluginError::InvalidManifest(format!(
@@ -453,6 +457,12 @@ fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(
     }
 
     Ok(())
+}
+
+fn strip_frontmatter_start(content: &str) -> Option<&str> {
+    content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {

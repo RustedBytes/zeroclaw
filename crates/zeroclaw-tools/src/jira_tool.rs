@@ -806,16 +806,15 @@ fn clean_email(s: &str) -> &str {
 
 fn extract_emails(text: &str) -> Vec<String> {
     let mut emails = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for word in text.split_whitespace() {
         if let Some(rest) = word.strip_prefix('@') {
             let email = clean_email(rest);
-            if email.contains('@') {
-                emails.push(email.to_string());
+            if email.contains('@') && seen.insert(email) {
+                emails.push(email.to_owned());
             }
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    emails.retain(|e| seen.insert(e.clone()));
     emails
 }
 
@@ -828,8 +827,7 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
         if ch == '*' && chars.peek() == Some(&'*') {
             chars.next(); // consume second *
             if !current.is_empty() {
-                nodes.push(json!({ "type": "text", "text": current.clone() }));
-                current.clear();
+                nodes.push(json!({ "type": "text", "text": std::mem::take(&mut current) }));
             }
             let mut bold = String::new();
             let mut closed = false;
@@ -872,8 +870,7 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
             if email.contains('@') {
                 if let Some((account_id, display_name)) = mentions.get(email) {
                     if !current.is_empty() {
-                        nodes.push(json!({ "type": "text", "text": current.clone() }));
-                        current.clear();
+                        nodes.push(json!({ "type": "text", "text": std::mem::take(&mut current) }));
                     }
                     nodes.push(json!({
                         "type": "mention",
@@ -912,15 +909,13 @@ fn build_adf(text: &str, mentions: &HashMap<String, (String, String)>) -> Value 
 
     let flush_paragraph = |paragraph: &mut Vec<Value>, content: &mut Vec<Value>| {
         if !paragraph.is_empty() {
-            content.push(json!({ "type": "paragraph", "content": paragraph.clone() }));
-            paragraph.clear();
+            content.push(json!({ "type": "paragraph", "content": std::mem::take(paragraph) }));
         }
     };
 
     let flush_list = |list_items: &mut Vec<Value>, content: &mut Vec<Value>| {
         if !list_items.is_empty() {
-            content.push(json!({ "type": "bulletList", "content": list_items.clone() }));
-            list_items.clear();
+            content.push(json!({ "type": "bulletList", "content": std::mem::take(list_items) }));
         }
     };
 
