@@ -18,6 +18,7 @@ ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web,jemalloc-allocator"
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
+        make \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
