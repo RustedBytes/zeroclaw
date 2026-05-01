@@ -236,6 +236,7 @@ impl OpenRouterProvider {
             .iter()
             .map(|m| {
                 if m.role == "assistant"
+                    && crate::json::looks_like_json_object(&m.content)
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
@@ -270,6 +271,7 @@ impl OpenRouterProvider {
                 }
 
                 if m.role == "tool"
+                    && crate::json::looks_like_json_object(&m.content)
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
                 {
                     let tool_call_id = value

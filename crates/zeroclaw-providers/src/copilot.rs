@@ -304,6 +304,7 @@ impl CopilotProvider {
             .iter()
             .map(|message| {
                 if message.role == "assistant"
+                    && crate::json::looks_like_json_object(&message.content)
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
@@ -335,6 +336,7 @@ impl CopilotProvider {
                 }
 
                 if message.role == "tool"
+                    && crate::json::looks_like_json_object(&message.content)
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                 {
                     let tool_call_id = value

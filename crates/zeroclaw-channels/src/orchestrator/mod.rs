@@ -684,8 +684,20 @@ fn build_channel_system_prompt(
     prompt
 }
 
+#[cfg(test)]
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut normalized = Vec::with_capacity(turns.len());
+    normalize_cached_channel_turns_from_iter(turns, None)
+}
+
+fn normalize_cached_channel_turns_from_slice(turns: &[ChatMessage]) -> Vec<ChatMessage> {
+    normalize_cached_channel_turns_from_iter(turns.iter().cloned(), Some(turns.len()))
+}
+
+fn normalize_cached_channel_turns_from_iter(
+    turns: impl IntoIterator<Item = ChatMessage>,
+    capacity_hint: Option<usize>,
+) -> Vec<ChatMessage> {
+    let mut normalized = Vec::with_capacity(capacity_hint.unwrap_or(0));
     let mut expecting_user = true;
 
     for turn in turns {
@@ -1167,7 +1179,7 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     let keep_from = turns
         .len()
         .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+    let mut compacted = normalize_cached_channel_turns_from_slice(&turns[keep_from..]);
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
@@ -1235,8 +1247,9 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
+    if turns.len() > max_history {
+        let overflow = turns.len() - max_history;
+        turns.drain(..overflow);
     }
 }
 
@@ -2733,18 +2746,20 @@ async fn process_channel_message(
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
-    // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
+    // Build history from per-sender conversation cache without first cloning
+    // the whole cached vector into a second temporary vector.
+    let mut prior_turns = if force_fresh_session {
         vec![ChatMessage::user(&msg.content)]
     } else {
-        ctx.conversation_histories
+        let mut histories = ctx
+            .conversation_histories
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        histories
             .get(&history_key)
-            .cloned()
+            .map(|turns| normalize_cached_channel_turns_from_slice(turns))
             .unwrap_or_default()
     };
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
