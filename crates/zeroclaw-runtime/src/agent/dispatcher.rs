@@ -1,7 +1,13 @@
 use crate::tools::{Tool, ToolSpec};
+use fixed_json::{Error as FixedJsonError, JsonSerializer};
 use serde_json::Value;
 use std::fmt::Write;
-use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
+use zeroclaw_providers::{
+    ChatMessage, ChatResponse, ConversationMessage, ToolCall, ToolResultMessage,
+};
+
+const FIXED_JSON_STACK_BYTES: usize = 4096;
+const TOOL_HISTORY_JSON_DEPTH: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -170,6 +176,88 @@ impl ToolDispatcher for XmlToolDispatcher {
 
 pub struct NativeToolDispatcher;
 
+fn fixed_json_string<F>(mut write_json: F) -> Result<String, FixedJsonError>
+where
+    F: FnMut(&mut JsonSerializer<'_, TOOL_HISTORY_JSON_DEPTH>) -> fixed_json::Result<()>,
+{
+    let mut stack = [0u8; FIXED_JSON_STACK_BYTES];
+    let mut serializer = JsonSerializer::new(&mut stack);
+    match write_json(&mut serializer).and_then(|()| serializer.finish().map(|_| ())) {
+        Ok(()) => return Ok(serializer.as_str().to_owned()),
+        Err(FixedJsonError::WriteLong) => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut capacity = FIXED_JSON_STACK_BYTES * 2;
+    loop {
+        let mut output = vec![0u8; capacity];
+        let mut serializer = JsonSerializer::new(&mut output);
+        match write_json(&mut serializer).and_then(|()| serializer.finish().map(|_| ())) {
+            Ok(()) => {
+                let len = serializer.len();
+                output.truncate(len);
+                // SAFETY: JsonSerializer only writes valid UTF-8 JSON bytes.
+                return Ok(unsafe { String::from_utf8_unchecked(output) });
+            }
+            Err(FixedJsonError::WriteLong) => {
+                if capacity > usize::MAX / 2 {
+                    return Err(FixedJsonError::WriteLong);
+                }
+                capacity = capacity.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn assistant_tool_history_json(
+    text: Option<&str>,
+    tool_calls: &[ToolCall],
+    reasoning_content: Option<&str>,
+) -> Result<String, FixedJsonError> {
+    fixed_json_string(|serializer| {
+        serializer.begin_object()?;
+        serializer.key("content")?;
+        if let Some(text) = text {
+            serializer.string(text)?;
+        } else {
+            serializer.null()?;
+        }
+
+        serializer.key("tool_calls")?;
+        serializer.begin_array()?;
+        for call in tool_calls {
+            serializer.begin_object()?;
+            serializer.key("id")?;
+            serializer.string(&call.id)?;
+            serializer.key("name")?;
+            serializer.string(&call.name)?;
+            serializer.key("arguments")?;
+            serializer.string(&call.arguments)?;
+            serializer.end_object()?;
+        }
+        serializer.end_array()?;
+
+        if let Some(reasoning_content) = reasoning_content {
+            serializer.key("reasoning_content")?;
+            serializer.string(reasoning_content)?;
+        }
+
+        serializer.end_object()
+    })
+}
+
+fn tool_result_history_json(result: &ToolResultMessage) -> Result<String, FixedJsonError> {
+    fixed_json_string(|serializer| {
+        serializer.begin_object()?;
+        serializer.key("tool_call_id")?;
+        serializer.string(&result.tool_call_id)?;
+        serializer.key("content")?;
+        serializer.string(&result.content)?;
+        serializer.end_object()
+    })
+}
+
 impl ToolDispatcher for NativeToolDispatcher {
     fn parse_response(&self, response: &ChatResponse) -> (String, Vec<ParsedToolCall>) {
         let text = response.text.clone().unwrap_or_default();
@@ -220,25 +308,42 @@ impl ToolDispatcher for NativeToolDispatcher {
                     tool_calls,
                     reasoning_content,
                 } => {
-                    let mut payload = serde_json::json!({
-                        "content": text,
-                        "tool_calls": tool_calls,
+                    let payload = assistant_tool_history_json(
+                        text.as_deref(),
+                        tool_calls,
+                        reasoning_content.as_deref(),
+                    )
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            error = %err,
+                            "fixed-json failed to serialize native assistant tool history; falling back to serde_json"
+                        );
+                        let mut payload = serde_json::json!({
+                            "content": text,
+                            "tool_calls": tool_calls,
+                        });
+                        if let Some(rc) = reasoning_content {
+                            payload["reasoning_content"] = serde_json::json!(rc);
+                        }
+                        payload.to_string()
                     });
-                    if let Some(rc) = reasoning_content {
-                        payload["reasoning_content"] = serde_json::json!(rc);
-                    }
-                    vec![ChatMessage::assistant(payload.to_string())]
+                    vec![ChatMessage::assistant(payload)]
                 }
                 ConversationMessage::ToolResults(results) => results
                     .iter()
                     .map(|result| {
-                        ChatMessage::tool(
+                        let payload = tool_result_history_json(result).unwrap_or_else(|err| {
+                            tracing::warn!(
+                                error = %err,
+                                "fixed-json failed to serialize native tool result history; falling back to serde_json"
+                            );
                             serde_json::json!({
                                 "tool_call_id": result.tool_call_id,
                                 "content": result.content,
                             })
-                            .to_string(),
-                        )
+                            .to_string()
+                        });
+                        ChatMessage::tool(payload)
                     })
                     .collect(),
             })
@@ -418,6 +523,43 @@ mod tests {
 
         let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
         assert!(payload.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn native_to_provider_messages_serializes_tool_history_with_fixed_json() {
+        let dispatcher = NativeToolDispatcher;
+        let history = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: Some("answer\nwith quote \" ok".into()),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "tc_1".into(),
+                    name: "shell".into(),
+                    arguments: "{\"command\":\"echo hi\"}".into(),
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc_1".into(),
+                content: "line 1\nline \"2\"".into(),
+            }]),
+        ];
+
+        let messages = dispatcher.to_provider_messages(&history);
+
+        let assistant_payload: serde_json::Value =
+            serde_json::from_str(&messages[0].content).unwrap();
+        assert_eq!(
+            assistant_payload["content"].as_str(),
+            Some("answer\nwith quote \" ok")
+        );
+        assert_eq!(
+            assistant_payload["tool_calls"][0]["arguments"].as_str(),
+            Some("{\"command\":\"echo hi\"}")
+        );
+
+        let tool_payload: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+        assert_eq!(tool_payload["tool_call_id"].as_str(), Some("tc_1"));
+        assert_eq!(tool_payload["content"].as_str(), Some("line 1\nline \"2\""));
     }
 
     #[test]

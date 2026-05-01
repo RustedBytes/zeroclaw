@@ -959,7 +959,6 @@ impl GeminiProvider {
         project: Option<&str>,
         oauth_token: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let req = self.http_client().post(url).json(request);
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 let token = oauth_token.unwrap_or_default();
@@ -984,7 +983,7 @@ impl GeminiProvider {
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-            _ => req,
+            _ => self.http_client().post(url).json(request),
         }
     }
 

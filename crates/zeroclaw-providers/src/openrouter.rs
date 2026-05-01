@@ -8,7 +8,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use futures_util::stream;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
@@ -393,6 +393,26 @@ impl OpenRouterProvider {
         Ok(value)
     }
 
+    fn apply_request_body<T: Serialize>(
+        &self,
+        builder: RequestBuilder,
+        request: &T,
+    ) -> anyhow::Result<RequestBuilder> {
+        let Some(_) = &self.extra_body else {
+            return Ok(builder.json(request));
+        };
+        let body = self.merge_extra_body(request)?;
+        Ok(builder.json(&body))
+    }
+
+    fn serialize_request_body<T: Serialize>(&self, request: &T) -> anyhow::Result<Vec<u8>> {
+        let Some(_) = &self.extra_body else {
+            return Ok(serde_json::to_vec(request)?);
+        };
+        let body = self.merge_extra_body(request)?;
+        Ok(serde_json::to_vec(&body)?)
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.openrouter",
@@ -489,14 +509,15 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
         };
 
-        let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&body)
+            .apply_request_body(
+                self.http_client()
+                    .post("https://openrouter.ai/api/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                    .header("X-Title", "ZeroClaw"),
+                &request,
+            )?
             .send()
             .await?;
 
@@ -545,14 +566,15 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
         };
 
-        let body = self.merge_extra_body(&request)?;
         let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&body)
+            .apply_request_body(
+                self.http_client()
+                    .post("https://openrouter.ai/api/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                    .header("X-Title", "ZeroClaw"),
+                &request,
+            )?
             .send()
             .await?;
 
@@ -600,14 +622,15 @@ impl Provider for OpenRouterProvider {
             stream: None,
         };
 
-        let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&body)
+            .apply_request_body(
+                self.http_client()
+                    .post("https://openrouter.ai/api/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                    .header("X-Title", "ZeroClaw"),
+                &native_request,
+            )?
             .send()
             .await?;
 
@@ -685,10 +708,11 @@ impl Provider for OpenRouterProvider {
             stream: Some(true),
         };
 
-        let payload = match serde_json::to_value(&native_request) {
-            Ok(v) => v,
+        let payload = match self.serialize_request_body(&native_request) {
+            Ok(payload) => payload,
             Err(e) => {
-                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+                return stream::once(async move { Err(StreamError::Provider(e.to_string())) })
+                    .boxed();
             }
         };
 
@@ -704,7 +728,8 @@ impl Provider for OpenRouterProvider {
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
                 .header("Accept", "text/event-stream")
-                .json(&payload)
+                .header("content-type", "application/json")
+                .body(payload)
                 .send()
                 .await
             {
@@ -807,14 +832,15 @@ impl Provider for OpenRouterProvider {
             stream: None,
         };
 
-        let body = self.merge_extra_body(&native_request)?;
         let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
-            .header("X-Title", "ZeroClaw")
-            .json(&body)
+            .apply_request_body(
+                self.http_client()
+                    .post("https://openrouter.ai/api/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                    .header("X-Title", "ZeroClaw"),
+                &native_request,
+            )?
             .send()
             .await?;
 

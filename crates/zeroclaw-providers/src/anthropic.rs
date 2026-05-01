@@ -571,14 +571,6 @@ impl AnthropicProvider {
         )
     }
 
-    /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
-        let mut body =
-            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
-        body["stream"] = serde_json::Value::Bool(true);
-        body
-    }
-
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
     async fn parse_anthropic_sse(
         response: reqwest::Response,
@@ -1037,7 +1029,12 @@ impl Provider for AnthropicProvider {
             stream: Some(true),
         };
 
-        let body = Self::build_streaming_request(&native_request);
+        let payload = match serde_json::to_vec(&native_request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return stream::once(async move { Err(StreamError::Json(error)) }).boxed();
+            }
+        };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
@@ -1049,7 +1046,7 @@ impl Provider for AnthropicProvider {
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body);
+                .body(payload);
 
             if is_oauth {
                 req = req

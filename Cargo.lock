@@ -13615,6 +13615,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "directories",
+ "fixed-json",
  "flate2",
  "fluent",
  "futures-util",
