@@ -2,7 +2,7 @@ use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage,
 use crate::schema::CostConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate, Utc};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -179,7 +179,11 @@ impl CostTracker {
 // Both the gateway and the channels supervisor share a single CostTracker
 // so that budget enforcement is consistent across all paths.
 
-static GLOBAL_COST_TRACKER: OnceLock<Option<Arc<CostTracker>>> = OnceLock::new();
+static GLOBAL_COST_TRACKER: OnceLock<RwLock<Option<Option<Arc<CostTracker>>>>> = OnceLock::new();
+
+fn global_cost_tracker_slot() -> &'static RwLock<Option<Option<Arc<CostTracker>>>> {
+    GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None))
+}
 
 impl CostTracker {
     /// Return the process-global `CostTracker`, creating it on first call.
@@ -187,20 +191,37 @@ impl CostTracker {
     /// receive the same `Arc`.  Returns `None` when cost tracking is disabled
     /// or initialisation fails.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
-        GLOBAL_COST_TRACKER
-            .get_or_init(|| {
-                if !config.enabled {
-                    return None;
+        let slot = global_cost_tracker_slot();
+        if let Some(tracker) = slot.read().as_ref() {
+            return tracker.clone();
+        }
+
+        let initialized = if config.enabled {
+            match Self::new(config, workspace_dir) {
+                Ok(ct) => Some(Arc::new(ct)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize global cost tracker: {e}");
+                    None
                 }
-                match Self::new(config, workspace_dir) {
-                    Ok(ct) => Some(Arc::new(ct)),
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize global cost tracker: {e}");
-                        None
-                    }
-                }
-            })
-            .clone()
+            }
+        } else {
+            None
+        };
+
+        let mut tracker = slot.write();
+        if let Some(existing) = tracker.as_ref() {
+            existing.clone()
+        } else {
+            *tracker = Some(initialized.clone());
+            initialized
+        }
+    }
+
+    /// Clear the process-global tracker so daemon shutdown can release owned config maps.
+    pub fn clear_global() {
+        if let Some(slot) = GLOBAL_COST_TRACKER.get() {
+            *slot.write() = None;
+        }
     }
 }
 

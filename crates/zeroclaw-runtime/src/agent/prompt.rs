@@ -143,7 +143,9 @@ impl PromptSection for ToolsSection {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
             let i18n_description = crate::i18n::get_tool_description(tool.name());
-            let desc = i18n_description.unwrap_or_else(|| tool.description());
+            let desc = i18n_description
+                .as_deref()
+                .unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",

@@ -4499,10 +4499,10 @@ fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Clie
 pub fn clear_runtime_proxy_client_cache() {
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
-            guard.clear();
+            *guard = HashMap::new();
         }
         Err(poisoned) => {
-            poisoned.into_inner().clear();
+            *poisoned.into_inner() = HashMap::new();
         }
     }
 }

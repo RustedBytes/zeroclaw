@@ -226,7 +226,9 @@ pub async fn run(
     for handle in handles {
         let _ = handle.await;
     }
+    crate::cost::CostTracker::clear_global();
     zeroclaw_config::schema::clear_runtime_proxy_client_cache();
+    crate::i18n::clear_cache();
 
     Ok(())
 }

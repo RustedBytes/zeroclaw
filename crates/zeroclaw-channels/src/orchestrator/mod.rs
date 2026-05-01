@@ -340,6 +340,21 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn clear_runtime_config_store() {
+    let mut store = runtime_config_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *store = HashMap::new();
+}
+
+struct RuntimeConfigStoreGuard;
+
+impl Drop for RuntimeConfigStoreGuard {
+    fn drop(&mut self) {
+        clear_runtime_config_store();
+    }
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -5344,6 +5359,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             },
         );
     }
+    let _runtime_config_store_guard = RuntimeConfigStoreGuard;
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));

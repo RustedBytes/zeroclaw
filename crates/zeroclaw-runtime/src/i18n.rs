@@ -5,28 +5,80 @@
 
 use fluent::{FluentBundle, FluentResource};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
-static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
-static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+#[derive(Default)]
+struct I18nCache {
+    descriptions: Option<HashMap<String, String>>,
+    cli_strings: Option<HashMap<String, String>>,
+}
+
+static I18N_CACHE: OnceLock<RwLock<I18nCache>> = OnceLock::new();
+
+fn cache() -> &'static RwLock<I18nCache> {
+    I18N_CACHE.get_or_init(|| RwLock::new(I18nCache::default()))
+}
 
 /// Initialize with a specific locale. No-op after first call.
 pub fn init(locale: &str) {
-    DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
-    CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
+    let mut cache = cache().write().unwrap_or_else(|e| e.into_inner());
+    if cache.descriptions.is_none() {
+        cache.descriptions = Some(load_descriptions(locale));
+    }
+    if cache.cli_strings.is_none() {
+        cache.cli_strings = Some(load_cli_strings(locale));
+    }
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
-pub fn get_tool_description(tool_name: &str) -> Option<&'static str> {
-    let map = DESCRIPTIONS.get_or_init(|| load_descriptions(&detect_locale()));
+pub fn get_tool_description(tool_name: &str) -> Option<String> {
     let key = format!("tool-{}", tool_name.replace('_', "-"));
-    map.get(&key).map(String::as_str)
+    {
+        let cache = cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(value) = cache
+            .descriptions
+            .as_ref()
+            .and_then(|map| map.get(&key).cloned())
+        {
+            return Some(value);
+        }
+    }
+
+    let locale = detect_locale();
+    let mut cache = cache().write().unwrap_or_else(|e| e.into_inner());
+    let map = cache
+        .descriptions
+        .get_or_insert_with(|| load_descriptions(&locale));
+    map.get(&key).cloned()
 }
 
 /// Get a CLI string by key (e.g. "cli-config-about").
 pub fn get_cli_string(key: &str) -> Option<String> {
-    let map = CLI_STRINGS.get_or_init(|| load_cli_strings(&detect_locale()));
+    {
+        let cache = cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(value) = cache
+            .cli_strings
+            .as_ref()
+            .and_then(|map| map.get(key).cloned())
+        {
+            return Some(value);
+        }
+    }
+
+    let locale = detect_locale();
+    let mut cache = cache().write().unwrap_or_else(|e| e.into_inner());
+    let map = cache
+        .cli_strings
+        .get_or_insert_with(|| load_cli_strings(&locale));
     map.get(key).cloned()
+}
+
+/// Clear loaded locale strings so daemon shutdown can release Fluent-derived
+/// maps before process exit. The next lookup lazily reloads them.
+pub fn clear_cache() {
+    let mut cache = cache().write().unwrap_or_else(|e| e.into_inner());
+    cache.descriptions = None;
+    cache.cli_strings = None;
 }
 
 fn load_descriptions(locale: &str) -> HashMap<String, String> {
