@@ -23,6 +23,7 @@ async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
+fixed-json = "0.4.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }

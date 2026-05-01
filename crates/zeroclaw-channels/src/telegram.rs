@@ -1,6 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
+use fixed_json::{Array, Attr, DefaultValue};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Body;
@@ -22,6 +23,9 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+/// Telegram Bot API getUpdates returns at most 100 updates unless a lower limit is requested.
+const TELEGRAM_MAX_POLLED_UPDATES: usize = 100;
+const TELEGRAM_API_DESCRIPTION_BUF_LEN: usize = 256;
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +35,63 @@ struct IncomingAttachment {
     file_size: Option<u64>,
     caption: Option<String>,
     kind: IncomingAttachmentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelegramPollSummary {
+    ok: bool,
+    error_code: i32,
+    description: [u8; TELEGRAM_API_DESCRIPTION_BUF_LEN],
+    max_update_id: Option<i64>,
+}
+
+fn parse_telegram_poll_summary(input: &str) -> fixed_json::Result<TelegramPollSummary> {
+    let mut ok = true;
+    let mut error_code = 0;
+    let mut description = [0u8; TELEGRAM_API_DESCRIPTION_BUF_LEN];
+    let mut update_count = 0usize;
+    let mut max_update_id: Option<i64> = None;
+
+    let mut parse_update = |update: &str, _index: usize| {
+        let mut update_id = 0;
+        let mut message_attrs = [Attr::ignore_any()];
+        let mut callback_query_attrs = [Attr::ignore_any()];
+        let mut attrs = [
+            Attr::integer("update_id", &mut update_id).nodefault(),
+            Attr::object("message", &mut message_attrs).nodefault(),
+            Attr::object("callback_query", &mut callback_query_attrs).nodefault(),
+            Attr::ignore_any(),
+        ];
+        let end = fixed_json::read_object(update, &mut attrs)?;
+        let update_id = i64::from(update_id);
+        max_update_id =
+            Some(max_update_id.map_or(update_id, |current: i64| current.max(update_id)));
+        Ok(end)
+    };
+
+    let mut attrs = [
+        Attr::boolean("ok", &mut ok).with_default(DefaultValue::Boolean(true)),
+        Attr::integer("error_code", &mut error_code).nodefault(),
+        Attr::string("description", &mut description).nodefault(),
+        Attr::array(
+            "result",
+            Array::StructObjects {
+                maxlen: TELEGRAM_MAX_POLLED_UPDATES,
+                count: Some(&mut update_count),
+                parser: &mut parse_update,
+            },
+        )
+        .nodefault(),
+        Attr::ignore_any(),
+    ];
+
+    fixed_json::read_object(input, &mut attrs)?;
+    Ok(TelegramPollSummary {
+        ok,
+        error_code,
+        description,
+        max_update_id,
+    })
 }
 
 /// The kind of incoming attachment (document vs photo).
@@ -3108,52 +3169,44 @@ impl Channel for TelegramChannel {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
+                    match resp.text().await {
                         Err(e) => {
                             tracing::warn!(
-                                "Telegram startup probe parse error: {e}; retrying in 5s"
+                                "Telegram startup probe response read error: {e}; retrying in 5s"
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
-                        Ok(data) => {
-                            let ok = data
-                                .get("ok")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false);
-                            if ok {
-                                // Slot claimed — advance offset past any queued updates.
-                                if let Some(results) =
-                                    data.get("result").and_then(serde_json::Value::as_array)
-                                {
-                                    for update in results {
-                                        if let Some(uid) = update
-                                            .get("update_id")
-                                            .and_then(serde_json::Value::as_i64)
-                                        {
-                                            offset = uid + 1;
-                                        }
-                                    }
-                                }
-                                break; // Probe succeeded; enter the long-poll loop.
-                            }
-
-                            let error_code = data
-                                .get("error_code")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or_default();
-                            if error_code == 409 {
-                                tracing::debug!("Startup probe: slot busy (409), retrying in 5s");
-                            } else {
-                                let desc = data
-                                    .get("description")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown");
+                        Ok(data) => match parse_telegram_poll_summary(&data) {
+                            Err(e) => {
                                 tracing::warn!(
-                                    "Startup probe: API error {error_code}: {desc}; retrying in 5s"
+                                    "Telegram startup probe fixed-json parse error: {e}; retrying in 5s"
                                 );
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
+                            Ok(summary) => {
+                                if summary.ok {
+                                    // Slot claimed — advance offset past any queued updates.
+                                    if let Some(uid) = summary.max_update_id {
+                                        offset = uid + 1;
+                                    }
+                                    break; // Probe succeeded; enter the long-poll loop.
+                                }
+
+                                let error_code = summary.error_code;
+                                if error_code == 409 {
+                                    tracing::debug!(
+                                        "Startup probe: slot busy (409), retrying in 5s"
+                                    );
+                                } else {
+                                    let desc = fixed_json::cstr(&summary.description);
+                                    let desc = if desc.is_empty() { "unknown" } else { desc };
+                                    tracing::warn!(
+                                        "Startup probe: API error {error_code}: {desc}; retrying in 5s"
+                                    );
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        },
                     }
                 }
             }
@@ -3187,7 +3240,52 @@ impl Channel for TelegramChannel {
                 }
             };
 
-            let data: serde_json::Value = match resp.json().await {
+            let data = match resp.text().await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Telegram response read error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            match parse_telegram_poll_summary(&data) {
+                Ok(summary) if !summary.ok => {
+                    let error_code = i64::from(summary.error_code);
+                    let description = fixed_json::cstr(&summary.description);
+                    let description = if description.is_empty() {
+                        "unknown Telegram API error"
+                    } else {
+                        description
+                    };
+
+                    if error_code == 409 {
+                        tracing::warn!(
+                            "Telegram polling conflict (409): {description}. \
+Ensure only one `zeroclaw` process is using this bot token."
+                        );
+                        // Back off for 35 seconds — longer than Telegram's 30-second poll
+                        // timeout — so any competing session (e.g. a stale connection from
+                        // a previous daemon) has time to expire before we retry.
+                        tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+                    } else {
+                        tracing::warn!(
+                            "Telegram getUpdates API error (code={}): {description}",
+                            error_code
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "Telegram fixed-json summary parse failed; falling back to serde_json: {e}"
+                    );
+                }
+            }
+
+            let data: serde_json::Value = match serde_json::from_str(&data) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("Telegram parse error: {e}");
@@ -3201,31 +3299,8 @@ impl Channel for TelegramChannel {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
             if !ok {
-                let error_code = data
-                    .get("error_code")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default();
-                let description = data
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown Telegram API error");
-
-                if error_code == 409 {
-                    tracing::warn!(
-                        "Telegram polling conflict (409): {description}. \
-Ensure only one `zeroclaw` process is using this bot token."
-                    );
-                    // Back off for 35 seconds — longer than Telegram's 30-second poll
-                    // timeout — so any competing session (e.g. a stale connection from
-                    // a previous daemon) has time to expire before we retry.
-                    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
-                } else {
-                    tracing::warn!(
-                        "Telegram getUpdates API error (code={}): {description}",
-                        error_code
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
+                tracing::warn!("Telegram getUpdates API error: unknown Telegram API error");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
 
@@ -3505,6 +3580,34 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_poll_summary_parses_with_fixed_json() {
+        let summary = parse_telegram_poll_summary(
+            r#"{"ok":true,"result":[{"update_id":41,"message":{"text":"ignored"}},{"update_id":43,"callback_query":{"data":"ignored"}}]}"#,
+        )
+        .expect("poll summary should parse");
+
+        assert!(summary.ok);
+        assert_eq!(summary.error_code, 0);
+        assert_eq!(summary.max_update_id, Some(43));
+    }
+
+    #[test]
+    fn telegram_poll_summary_parses_api_error_with_fixed_json() {
+        let summary = parse_telegram_poll_summary(
+            r#"{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}"#,
+        )
+        .expect("error summary should parse");
+
+        assert!(!summary.ok);
+        assert_eq!(summary.error_code, 409);
+        assert_eq!(
+            fixed_json::cstr(&summary.description),
+            "Conflict: terminated by other getUpdates request"
+        );
+        assert_eq!(summary.max_update_id, None);
     }
 
     #[test]

@@ -3130,6 +3130,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
+name = "fixed-json"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3235cd6b6a1f27f7cb6c7c84a25ea8fe79e739ffd206b2715364db21d037d1c0"
+
+[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13272,6 +13278,7 @@ dependencies = [
  "cpal",
  "directories",
  "ecb",
+ "fixed-json",
  "futures-util",
  "hex",
  "hmac 0.12.1",
