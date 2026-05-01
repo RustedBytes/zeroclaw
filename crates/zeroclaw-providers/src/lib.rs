@@ -25,6 +25,7 @@ pub mod compatible;
 pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
+mod json;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
 pub mod models_dev;

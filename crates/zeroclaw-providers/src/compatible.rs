@@ -918,8 +918,7 @@ impl StreamToolCallAccumulator {
         } else {
             self.arguments
         };
-        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
-        {
+        let normalized_arguments = if crate::json::is_valid_json_no_alloc(&arguments) {
             arguments
         } else {
             tracing::warn!(
@@ -1674,17 +1673,16 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments =
-                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
-                        arguments
-                    } else {
-                        tracing::warn!(
-                            function = %name,
-                            arguments = %arguments,
-                            "Invalid JSON in native tool-call arguments, using empty object"
-                        );
-                        "{}".to_string()
-                    };
+                let normalized_arguments = if crate::json::is_valid_json_no_alloc(&arguments) {
+                    arguments
+                } else {
+                    tracing::warn!(
+                        function = %name,
+                        arguments = %arguments,
+                        "Invalid JSON in native tool-call arguments, using empty object"
+                    );
+                    "{}".to_string()
+                };
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
