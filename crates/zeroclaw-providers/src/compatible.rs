@@ -830,52 +830,87 @@ struct ResponsesContent {
 
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
-struct StreamChunkResponse {
+struct StreamChunkResponse<'a> {
     #[serde(default)]
-    choices: Vec<StreamChoice>,
+    #[serde(borrow)]
+    choices: Vec<StreamChoice<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct StreamChoice {
+struct StreamChoice<'a> {
     #[serde(default)]
-    delta: StreamDelta,
+    delta: StreamDelta<'a>,
     #[serde(default)]
-    finish_reason: Option<String>,
+    #[serde(borrow)]
+    finish_reason: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct StreamDelta {
+struct StreamDelta<'a> {
     #[serde(default)]
-    content: Option<String>,
+    #[serde(borrow)]
+    content: Option<Cow<'a, str>>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
-    reasoning_content: Option<String>,
+    #[serde(borrow)]
+    reasoning_content: Option<Cow<'a, str>>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     #[serde(default)]
-    tool_calls: Option<Vec<StreamToolCallDelta>>,
+    #[serde(borrow)]
+    tool_calls: Option<Vec<StreamToolCallDelta<'a>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct StreamToolCallDelta {
+struct StreamToolCallDelta<'a> {
     #[serde(default)]
     index: Option<usize>,
     #[serde(default)]
-    id: Option<String>,
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
     #[serde(default)]
-    function: Option<StreamFunctionDelta>,
+    #[serde(borrow)]
+    function: Option<StreamFunctionDelta<'a>>,
     // Compatibility: some providers stream name/arguments at top-level.
     #[serde(default)]
-    name: Option<String>,
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
     #[serde(default)]
-    arguments: Option<String>,
+    #[serde(borrow)]
+    arguments: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct StreamFunctionDelta {
+struct StreamFunctionDelta<'a> {
     #[serde(default)]
-    name: Option<String>,
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
     #[serde(default)]
-    arguments: Option<String>,
+    #[serde(borrow)]
+    arguments: Option<Cow<'a, str>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyToolEvent<'a> {
+    #[serde(default, borrow)]
+    x_tool_start: Option<ProxyToolStart<'a>>,
+    #[serde(default, borrow)]
+    x_tool_result: Option<ProxyToolResult<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyToolStart<'a> {
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    #[serde(default, borrow)]
+    arguments: Option<Cow<'a, str>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyToolResult<'a> {
+    #[serde(default, borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    output: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Default)]
@@ -886,9 +921,9 @@ struct StreamToolCallAccumulator {
 }
 
 impl StreamToolCallAccumulator {
-    fn apply_delta(&mut self, delta: &StreamToolCallDelta) {
+    fn apply_delta(&mut self, delta: &StreamToolCallDelta<'_>) {
         if let Some(id) = delta.id.as_ref().filter(|value| !value.is_empty()) {
-            self.id = Some(id.clone());
+            self.id = Some(id.to_string());
         }
 
         let delta_name = delta
@@ -898,7 +933,7 @@ impl StreamToolCallAccumulator {
             .or(delta.name.as_ref())
             .filter(|value| !value.is_empty());
         if let Some(name) = delta_name {
-            self.name = Some(name.clone());
+            self.name = Some(name.to_string());
         }
 
         if let Some(arguments_delta) = delta
@@ -938,7 +973,7 @@ impl StreamToolCallAccumulator {
     }
 }
 
-fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
+fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse<'_>>> {
     let line = line.trim();
 
     if line.is_empty() || line.starts_with(':') {
@@ -964,56 +999,48 @@ fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
 /// internally and forward observability events via custom SSE fields.
 fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
     let data = line.trim().strip_prefix("data:")?.trim();
-    let obj: serde_json::Value = serde_json::from_str(data).ok()?;
+    let event: ProxyToolEvent<'_> = serde_json::from_str(data).ok()?;
 
-    if let Some(ts) = obj.get("x_tool_start") {
-        let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
-            tracing::debug!("proxy x_tool_start event missing required 'name' field");
-            return None;
-        };
-        let name = name.to_string();
-        let args = ts
-            .get("arguments")
-            .and_then(|v| v.as_str())
-            .unwrap_or("{}")
-            .to_string();
-        return Some(StreamEvent::PreExecutedToolCall { name, args });
+    if let Some(ts) = event.x_tool_start {
+        return Some(StreamEvent::PreExecutedToolCall {
+            name: ts.name.into_owned(),
+            args: ts
+                .arguments
+                .map(Cow::into_owned)
+                .unwrap_or_else(|| "{}".to_string()),
+        });
     }
 
-    if let Some(tr) = obj.get("x_tool_result") {
-        let name = tr
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let output = tr
-            .get("output")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        return Some(StreamEvent::PreExecutedToolResult { name, output });
+    if let Some(tr) = event.x_tool_result {
+        return Some(StreamEvent::PreExecutedToolResult {
+            name: tr
+                .name
+                .map(Cow::into_owned)
+                .unwrap_or_else(|| "unknown".to_string()),
+            output: tr.output.map(Cow::into_owned).unwrap_or_default(),
+        });
     }
 
     None
 }
 
-fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
+fn extract_sse_text_delta(choice: &StreamChoice<'_>) -> Option<String> {
     if let Some(content) = &choice.delta.content
         && !content.is_empty()
     {
-        return Some(content.clone());
+        return Some(content.to_string());
     }
 
     None
 }
 
-fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
+fn extract_sse_reasoning_delta(choice: &StreamChoice<'_>) -> Option<String> {
     choice
         .delta
         .reasoning_content
         .as_ref()
         .filter(|value| !value.is_empty())
-        .cloned()
+        .map(ToString::to_string)
 }
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
@@ -1032,12 +1059,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
         if let Some(content) = &choice.delta.content
             && !content.is_empty()
         {
-            return Ok(Some(StreamChunk::delta(content.clone())));
+            return Ok(Some(StreamChunk::delta(content.to_string())));
         }
         if let Some(reasoning) = &choice.delta.reasoning_content
             && !reasoning.is_empty()
         {
-            return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
+            return Ok(Some(StreamChunk::reasoning(reasoning.to_string())));
         }
     }
 
@@ -1096,10 +1123,13 @@ fn sse_bytes_to_chunks(
                     buffer.push_str(&text);
 
                     while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].to_string();
+                        let parsed = {
+                            let line = &buffer[..pos];
+                            parse_sse_line(line)
+                        };
                         buffer.drain(..=pos);
 
-                        match parse_sse_line(&line) {
+                        match parsed {
                             Ok(Some(chunk)) => {
                                 let chunk = if count_tokens {
                                     chunk.with_token_estimate()
@@ -1512,19 +1542,19 @@ impl OpenAiCompatibleProvider {
             .map(|message| {
                 if message.role == "assistant"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    && let Some(tool_calls_value) = value.get("tool_calls")
-                    && let Ok(parsed_calls) =
-                        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredAssistantToolHistory<'_>,
+                    >(&message.content)
+                    && let Some(parsed_calls) = stored.tool_calls
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| ToolCall {
-                            id: Some(tc.id),
+                            id: Some(tc.id.into_owned()),
                             kind: Some("function".to_string()),
                             function: Some(Function {
-                                name: Some(tc.name),
-                                arguments: Some(tc.arguments),
+                                name: Some(tc.name.into_owned()),
+                                arguments: Some(tc.arguments.into_owned()),
                             }),
                             name: None,
                             arguments: None,
@@ -1532,43 +1562,30 @@ impl OpenAiCompatibleProvider {
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(Cow::Owned(value.to_string())));
-
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| Cow::Owned(value.to_string()));
-
                     return NativeMessage {
                         role: Cow::Borrowed("assistant"),
-                        content,
+                        content: stored.content.map(MessageContent::Text),
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content,
+                        reasoning_content: stored.reasoning_content,
                     };
                 }
 
                 if message.role == "tool"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredToolResultHistory<'_>,
+                    >(&message.content)
                 {
-                    let tool_call_id = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| Cow::Owned(value.to_string()));
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(Cow::Owned(value.to_string())))
+                    let content = stored
+                        .content
+                        .map(MessageContent::Text)
                         .or_else(|| Some(MessageContent::Text(Cow::Borrowed(&message.content))));
 
                     return NativeMessage {
                         role: Cow::Borrowed("tool"),
                         content,
-                        tool_call_id,
+                        tool_call_id: stored.tool_call_id,
                         tool_calls: None,
                         reasoning_content: None,
                     };
@@ -1612,14 +1629,12 @@ impl OpenAiCompatibleProvider {
             }
             if msg.role == "assistant"
                 && crate::json::looks_like_json_object(&msg.content)
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
-                && value.get("tool_calls").is_some()
+                && let Ok(stored) = serde_json::from_str::<
+                    crate::json::StoredAssistantToolHistory<'_>,
+                >(&msg.content)
+                && stored.tool_calls.is_some()
             {
-                let text = value
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let text = stored.content.map(Cow::into_owned).unwrap_or_default();
                 return if text.is_empty() {
                     None
                 } else {
@@ -3988,10 +4003,10 @@ mod tests {
         let mut acc = StreamToolCallAccumulator::default();
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
-            id: Some("call_1".to_string()),
+            id: Some(Cow::Borrowed("call_1")),
             function: Some(StreamFunctionDelta {
-                name: Some("shell".to_string()),
-                arguments: Some("{\"command\":\"".to_string()),
+                name: Some(Cow::Borrowed("shell")),
+                arguments: Some(Cow::Borrowed("{\"command\":\"")),
             }),
             name: None,
             arguments: None,
@@ -4001,7 +4016,7 @@ mod tests {
             id: None,
             function: Some(StreamFunctionDelta {
                 name: None,
-                arguments: Some("date\"}".to_string()),
+                arguments: Some(Cow::Borrowed("date\"}")),
             }),
             name: None,
             arguments: None,

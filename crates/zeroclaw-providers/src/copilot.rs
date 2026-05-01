@@ -305,31 +305,28 @@ impl CopilotProvider {
             .map(|message| {
                 if message.role == "assistant"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    && let Some(tool_calls_value) = value.get("tool_calls")
-                    && let Ok(parsed_calls) =
-                        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredAssistantToolHistory<'_>,
+                    >(&message.content)
+                    && let Some(parsed_calls) = stored.tool_calls
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tool_call| NativeToolCall {
-                            id: Some(tool_call.id),
+                            id: Some(tool_call.id.into_owned()),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tool_call.name,
-                                arguments: tool_call.arguments,
+                                name: tool_call.name.into_owned(),
+                                arguments: tool_call.arguments.into_owned(),
                             },
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|s| ApiContent::Text(s.to_string()));
-
                     return ApiMessage {
                         role: "assistant".to_string(),
-                        content,
+                        content: stored
+                            .content
+                            .map(|value| ApiContent::Text(value.into_owned())),
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
                     };
@@ -337,21 +334,16 @@ impl CopilotProvider {
 
                 if message.role == "tool"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredToolResultHistory<'_>,
+                    >(&message.content)
                 {
-                    let tool_call_id = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|s| ApiContent::Text(s.to_string()));
-
                     return ApiMessage {
                         role: "tool".to_string(),
-                        content,
-                        tool_call_id,
+                        content: stored
+                            .content
+                            .map(|value| ApiContent::Text(value.into_owned())),
+                        tool_call_id: stored.tool_call_id.map(std::borrow::Cow::into_owned),
                         tool_calls: None,
                     };
                 }

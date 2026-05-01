@@ -213,55 +213,42 @@ impl AzureOpenAiProvider {
             .map(|m| {
                 if m.role == "assistant"
                     && crate::json::looks_like_json_object(&m.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
-                    && let Some(tool_calls_value) = value.get("tool_calls")
-                    && let Ok(parsed_calls) =
-                        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredAssistantToolHistory<'_>,
+                    >(&m.content)
+                    && let Some(parsed_calls) = stored.tool_calls
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
+                            id: Some(tc.id.into_owned()),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
+                                name: tc.name.into_owned(),
+                                arguments: tc.arguments.into_owned(),
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
                     return NativeMessage {
                         role: "assistant".to_string(),
-                        content,
+                        content: stored.content.map(std::borrow::Cow::into_owned),
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content,
+                        reasoning_content: stored
+                            .reasoning_content
+                            .map(std::borrow::Cow::into_owned),
                     };
                 }
 
                 if m.role == "tool"
                     && crate::json::looks_like_json_object(&m.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Ok(stored) =
+                        serde_json::from_str::<crate::json::StoredToolResultHistory<'_>>(&m.content)
                 {
-                    let tool_call_id = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
                     return NativeMessage {
                         role: "tool".to_string(),
-                        content,
-                        tool_call_id,
+                        content: stored.content.map(std::borrow::Cow::into_owned),
+                        tool_call_id: stored.tool_call_id.map(std::borrow::Cow::into_owned),
                         tool_calls: None,
                         reasoning_content: None,
                     };

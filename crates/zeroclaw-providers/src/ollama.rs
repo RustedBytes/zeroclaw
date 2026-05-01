@@ -357,31 +357,30 @@ impl OllamaProvider {
             .map(|message| {
                 if message.role == "assistant"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    && let Some(tool_calls_value) = value.get("tool_calls")
-                    && let Ok(parsed_calls) =
-                        serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredAssistantToolHistory<'_>,
+                    >(&message.content)
+                    && let Some(parsed_calls) = stored.tool_calls
                 {
                     let outgoing_calls: Vec<OutgoingToolCall> = parsed_calls
                         .into_iter()
                         .map(|call| {
-                            tool_name_by_id.insert(call.id.clone(), call.name.clone());
+                            let id = call.id.into_owned();
+                            let name = call.name.into_owned();
+                            let arguments = call.arguments.into_owned();
+                            tool_name_by_id.insert(id, name.clone());
                             OutgoingToolCall {
                                 kind: "function".to_string(),
                                 function: OutgoingFunction {
-                                    name: call.name,
-                                    arguments: Self::parse_tool_arguments(&call.arguments),
+                                    name,
+                                    arguments: Self::parse_tool_arguments(&arguments),
                                 },
                             }
                         })
                         .collect();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
                     return Message {
                         role: "assistant".to_string(),
-                        content,
+                        content: stored.content.map(std::borrow::Cow::into_owned),
                         images: None,
                         tool_calls: Some(outgoing_calls),
                         tool_name: None,
@@ -390,23 +389,24 @@ impl OllamaProvider {
 
                 if message.role == "tool"
                     && crate::json::looks_like_json_object(&message.content)
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Ok(stored) = serde_json::from_str::<
+                        crate::json::StoredToolResultHistory<'_>,
+                    >(&message.content)
                 {
-                    let tool_name = value
-                        .get("tool_name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                        .or_else(|| {
-                            value
-                                .get("tool_call_id")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|id| tool_name_by_id.get(id))
-                                .cloned()
-                        });
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
+                    let tool_name =
+                        stored
+                            .tool_name
+                            .map(std::borrow::Cow::into_owned)
+                            .or_else(|| {
+                                stored
+                                    .tool_call_id
+                                    .as_deref()
+                                    .and_then(|id| tool_name_by_id.get(id))
+                                    .cloned()
+                            });
+                    let content = stored
+                        .content
+                        .map(std::borrow::Cow::into_owned)
                         .or_else(|| {
                             (!message.content.trim().is_empty()).then_some(message.content.clone())
                         });
