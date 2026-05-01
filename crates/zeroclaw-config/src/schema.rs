@@ -4491,7 +4491,12 @@ fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Clie
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn clear_runtime_proxy_client_cache() {
+/// Drop cached reqwest clients built from runtime proxy settings.
+///
+/// This is called when proxy settings change and during daemon shutdown so
+/// connection pools, TLS session caches, and background resources are released
+/// before the process exits.
+pub fn clear_runtime_proxy_client_cache() {
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             guard.clear();

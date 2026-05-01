@@ -226,6 +226,7 @@ pub async fn run(
     for handle in handles {
         let _ = handle.await;
     }
+    zeroclaw_config::schema::clear_runtime_proxy_client_cache();
 
     Ok(())
 }

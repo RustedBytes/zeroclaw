@@ -107,11 +107,47 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 /// reuse authenticated channel instances (critical for Matrix E2EE — avoids re-running session
 /// restore on every cron delivery).
 ///
-/// Set once at startup; valid for the process lifetime. Daemon restart is required to pick up
-/// channel-config changes — there's no in-flight refresh path. Callers must tolerate the
-/// `OnceLock::get()` returning `None` during the brief window before `start_channels` populates
-/// it; `deliver_announcement` falls back to per-call channel reconstruction in that case.
-static CRON_CHANNEL_REGISTRY: OnceLock<Arc<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+/// The slot is clearable so daemon shutdown can release channel-owned clients,
+/// sockets, and TLS caches instead of keeping them alive for the process lifetime.
+/// Daemon restart is still required to pick up channel-config changes; there is
+/// no in-flight refresh path.
+static CRON_CHANNEL_REGISTRY: OnceLock<
+    std::sync::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>>,
+> = OnceLock::new();
+
+fn cron_channel_registry_slot()
+-> &'static std::sync::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>> {
+    CRON_CHANNEL_REGISTRY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn set_cron_channel_registry(registry: Arc<HashMap<String, Arc<dyn Channel>>>) {
+    match cron_channel_registry_slot().write() {
+        Ok(mut guard) => *guard = Some(registry),
+        Err(poisoned) => *poisoned.into_inner() = Some(registry),
+    }
+}
+
+fn clear_cron_channel_registry() {
+    match cron_channel_registry_slot().write() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
+fn cron_channel_registry() -> Option<Arc<HashMap<String, Arc<dyn Channel>>>> {
+    match cron_channel_registry_slot().read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+struct CronChannelRegistryGuard;
+
+impl Drop for CronChannelRegistryGuard {
+    fn drop(&mut self) {
+        clear_cron_channel_registry();
+    }
+}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -2532,6 +2568,37 @@ fn compute_max_in_flight_messages(channel_count: usize) -> usize {
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result {
         tracing::error!("Channel message worker crashed: {error}");
+    }
+}
+
+#[derive(Default)]
+struct AbortOnDropJoinHandles {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl AbortOnDropJoinHandles {
+    fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    fn abort_all(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+
+    async fn join_all(mut self) {
+        while let Some(handle) = self.handles.pop() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDropJoinHandles {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
     }
 }
 
@@ -5602,7 +5669,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
 
     // Spawn a listener for each channel
-    let mut handles = Vec::new();
+    let mut handles = AbortOnDropJoinHandles::default();
     for ch in &channels {
         handles.push(spawn_supervised_listener(
             ch.clone(),
@@ -5619,7 +5686,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
-    let _ = CRON_CHANNEL_REGISTRY.set(Arc::clone(&channels_by_name));
+    set_cron_channel_registry(Arc::clone(&channels_by_name));
+    let _cron_registry_guard = CronChannelRegistryGuard;
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
@@ -5850,10 +5918,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
-    // Wait for all channel tasks
-    for h in handles {
-        let _ = h.await;
-    }
+    // The dispatch loop only returns when the channel senders are closed. Listener
+    // tasks are supervised loops, so abort them before joining. The abort-on-drop
+    // guard also covers daemon shutdown, where `start_channels` may be cancelled
+    // while listeners are still blocked in network I/O.
+    handles.abort_all();
+    handles.join_all().await;
 
     Ok(())
 }
@@ -5877,7 +5947,7 @@ pub async fn deliver_announcement(
 
     // Use the live channel instance when available — critical for Matrix E2EE which must
     // reuse the authenticated client rather than re-running session restore per delivery.
-    if let Some(registry) = CRON_CHANNEL_REGISTRY.get()
+    if let Some(registry) = cron_channel_registry()
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
         return ch.send(&SendMessage::new(&safe_output, target)).await;
