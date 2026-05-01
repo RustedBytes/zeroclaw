@@ -17,6 +17,7 @@ use crate::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::borrow::Cow;
 
 /// Telnyx Inference Engine public endpoint.
 const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
@@ -137,16 +138,16 @@ struct ModelInfo {
 
 /// Request body for chat completions
 #[derive(Debug, serde::Serialize)]
-struct ChatRequest {
+struct ChatRequest<'a> {
     model: String,
-    messages: Vec<Message>,
+    messages: Vec<Message<'a>>,
     temperature: f64,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct Message {
-    role: String,
-    content: String,
+struct Message<'a> {
+    role: Cow<'a, str>,
+    content: Cow<'a, str>,
 }
 
 /// Response from chat completions API
@@ -190,14 +191,14 @@ impl Provider for TelnyxProvider {
 
         if let Some(sys) = system_prompt {
             messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
+                role: Cow::Borrowed("system"),
+                content: Cow::Borrowed(sys),
             });
         }
 
         messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
+            role: Cow::Borrowed("user"),
+            content: Cow::Borrowed(message),
         });
 
         let request = ChatRequest {
@@ -248,8 +249,8 @@ impl Provider for TelnyxProvider {
         let api_messages: Vec<Message> = messages
             .iter()
             .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
+                role: Cow::Borrowed(&m.role),
+                content: Cow::Borrowed(&m.content),
             })
             .collect();
 
@@ -368,12 +369,12 @@ mod tests {
             model: "openai/gpt-4o".to_string(),
             messages: vec![
                 Message {
-                    role: "system".to_string(),
-                    content: "You are helpful.".to_string(),
+                    role: Cow::Borrowed("system"),
+                    content: Cow::Borrowed("You are helpful."),
                 },
                 Message {
-                    role: "user".to_string(),
-                    content: "Hello".to_string(),
+                    role: Cow::Borrowed("user"),
+                    content: Cow::Borrowed("Hello"),
                 },
             ],
             temperature: 0.7,

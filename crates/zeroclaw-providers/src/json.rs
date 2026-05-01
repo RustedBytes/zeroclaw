@@ -31,7 +31,7 @@ pub(crate) struct StoredProviderToolCall<'a> {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StoredToolResultHistory<'a> {
-    #[serde(default, borrow)]
+    #[serde(default, borrow, alias = "tool_use_id", alias = "toolUseId")]
     pub(crate) tool_call_id: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     pub(crate) tool_name: Option<Cow<'a, str>>,

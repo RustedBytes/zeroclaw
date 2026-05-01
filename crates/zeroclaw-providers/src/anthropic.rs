@@ -309,15 +309,17 @@ impl AnthropicProvider {
     }
 
     fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<NativeContentOut>> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_calls = value
-            .get("tool_calls")
-            .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
+        if !crate::json::looks_like_json_object(content) {
+            return None;
+        }
+        let stored =
+            serde_json::from_str::<crate::json::StoredAssistantToolHistory<'_>>(content).ok()?;
+        let tool_calls = stored.tool_calls?;
 
         let mut blocks = Vec::new();
-        if let Some(text) = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
+        if let Some(text) = stored
+            .content
+            .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
@@ -330,8 +332,8 @@ impl AnthropicProvider {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
             blocks.push(NativeContentOut::ToolUse {
-                id: call.id,
-                name: call.name,
+                id: call.id.into_owned(),
+                name: call.name.into_owned(),
                 input,
                 cache_control: None,
             });
@@ -340,16 +342,15 @@ impl AnthropicProvider {
     }
 
     fn parse_tool_result_message(content: &str) -> Option<NativeMessage> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_use_id = value
-            .get("tool_call_id")
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        let result = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        if !crate::json::looks_like_json_object(content) {
+            return None;
+        }
+        let stored =
+            serde_json::from_str::<crate::json::StoredToolResultHistory<'_>>(content).ok()?;
+        let tool_use_id = stored.tool_call_id?.into_owned();
+        let result = stored
+            .content
+            .map_or_else(String::new, |value| value.into_owned());
         Some(NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {

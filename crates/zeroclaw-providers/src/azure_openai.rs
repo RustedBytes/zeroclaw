@@ -5,6 +5,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use zeroclaw_api::tool::ToolSpec;
 
 const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
@@ -20,15 +21,15 @@ pub struct AzureOpenAiProvider {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatRequest {
-    messages: Vec<Message>,
+struct ChatRequest<'a> {
+    messages: Vec<Message<'a>>,
     temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct Message {
-    role: String,
-    content: String,
+struct Message<'a> {
+    role: Cow<'a, str>,
+    content: Cow<'a, str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,8 +60,8 @@ impl ResponseMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest {
-    messages: Vec<NativeMessage>,
+struct NativeChatRequest<'a> {
+    messages: Vec<NativeMessage<'a>>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
@@ -69,16 +70,16 @@ struct NativeChatRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeMessage {
-    role: String,
+struct NativeMessage<'a> {
+    role: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    tool_call_id: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,7 +208,7 @@ impl AzureOpenAiProvider {
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage<'_>> {
         messages
             .iter()
             .map(|m| {
@@ -230,13 +231,11 @@ impl AzureOpenAiProvider {
                         })
                         .collect::<Vec<_>>();
                     return NativeMessage {
-                        role: "assistant".to_string(),
-                        content: stored.content.map(std::borrow::Cow::into_owned),
+                        role: Cow::Borrowed("assistant"),
+                        content: stored.content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content: stored
-                            .reasoning_content
-                            .map(std::borrow::Cow::into_owned),
+                        reasoning_content: stored.reasoning_content,
                     };
                 }
 
@@ -246,17 +245,17 @@ impl AzureOpenAiProvider {
                         serde_json::from_str::<crate::json::StoredToolResultHistory<'_>>(&m.content)
                 {
                     return NativeMessage {
-                        role: "tool".to_string(),
-                        content: stored.content.map(std::borrow::Cow::into_owned),
-                        tool_call_id: stored.tool_call_id.map(std::borrow::Cow::into_owned),
+                        role: Cow::Borrowed("tool"),
+                        content: stored.content,
+                        tool_call_id: stored.tool_call_id,
                         tool_calls: None,
                         reasoning_content: None,
                     };
                 }
 
                 NativeMessage {
-                    role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    role: Cow::Borrowed(&m.role),
+                    content: Some(Cow::Borrowed(&m.content)),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -350,14 +349,14 @@ impl Provider for AzureOpenAiProvider {
 
         if let Some(sys) = system_prompt {
             messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
+                role: Cow::Borrowed("system"),
+                content: Cow::Borrowed(sys),
             });
         }
 
         messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
+            role: Cow::Borrowed("user"),
+            content: Cow::Borrowed(message),
         });
 
         let request = ChatRequest {
@@ -593,12 +592,12 @@ mod tests {
         let req = ChatRequest {
             messages: vec![
                 Message {
-                    role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    role: Cow::Borrowed("system"),
+                    content: Cow::Borrowed("You are ZeroClaw"),
                 },
                 Message {
-                    role: "user".to_string(),
-                    content: "hello".to_string(),
+                    role: Cow::Borrowed("user"),
+                    content: Cow::Borrowed("hello"),
                 },
             ],
             temperature: 0.7,
@@ -614,8 +613,8 @@ mod tests {
     fn request_serializes_without_system() {
         let req = ChatRequest {
             messages: vec![Message {
-                role: "user".to_string(),
-                content: "hello".to_string(),
+                role: Cow::Borrowed("user"),
+                content: Cow::Borrowed("hello"),
             }],
             temperature: 0.0,
         };

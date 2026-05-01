@@ -720,13 +720,13 @@ impl BedrockProvider {
 
     /// Try to extract a tool_call_id from partially-valid JSON content.
     fn extract_tool_call_id(content: &str) -> Option<String> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        value
-            .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
-            .and_then(serde_json::Value::as_str)
-            .map(String::from)
+        if !crate::json::looks_like_json_object(content) {
+            return None;
+        }
+        serde_json::from_str::<crate::json::StoredToolResultHistory<'_>>(content)
+            .ok()?
+            .tool_call_id
+            .map(std::borrow::Cow::into_owned)
     }
 
     /// Find the first unmatched tool_use_id from the last assistant message.
@@ -849,15 +849,17 @@ impl BedrockProvider {
 
     /// Parse assistant message containing structured tool calls.
     fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_calls = value
-            .get("tool_calls")
-            .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
+        if !crate::json::looks_like_json_object(content) {
+            return None;
+        }
+        let stored =
+            serde_json::from_str::<crate::json::StoredAssistantToolHistory<'_>>(content).ok()?;
+        let tool_calls = stored.tool_calls?;
 
         let mut blocks = Vec::new();
-        if let Some(text) = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
+        if let Some(text) = stored
+            .content
+            .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
@@ -870,8 +872,8 @@ impl BedrockProvider {
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
             blocks.push(ContentBlock::ToolUse(ToolUseWrapper {
                 tool_use: ToolUseBlock {
-                    tool_use_id: call.id,
-                    name: call.name,
+                    tool_use_id: call.id.into_owned(),
+                    name: call.name.into_owned(),
                     input,
                 },
             }));
@@ -881,18 +883,15 @@ impl BedrockProvider {
 
     /// Parse tool result message into a user message with ToolResult block.
     fn parse_tool_result_message(content: &str) -> Option<ConverseMessage> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_use_id = value
-            .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        let result = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        if !crate::json::looks_like_json_object(content) {
+            return None;
+        }
+        let stored =
+            serde_json::from_str::<crate::json::StoredToolResultHistory<'_>>(content).ok()?;
+        let tool_use_id = stored.tool_call_id?.into_owned();
+        let result = stored
+            .content
+            .map_or_else(String::new, |value| value.into_owned());
         Some(ConverseMessage {
             role: "user".to_string(),
             content: vec![ContentBlock::ToolResult(ToolResultWrapper {

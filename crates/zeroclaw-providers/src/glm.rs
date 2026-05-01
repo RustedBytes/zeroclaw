@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,16 +20,16 @@ pub struct GlmProvider {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatRequest {
+struct ChatRequest<'a> {
     model: String,
-    messages: Vec<Message>,
+    messages: Vec<Message<'a>>,
     temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct Message {
-    role: String,
-    content: String,
+struct Message<'a> {
+    role: Cow<'a, str>,
+    content: Cow<'a, str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,14 +166,14 @@ impl Provider for GlmProvider {
 
         if let Some(sys) = system_prompt {
             messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
+                role: Cow::Borrowed("system"),
+                content: Cow::Borrowed(sys),
             });
         }
 
         messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
+            role: Cow::Borrowed("user"),
+            content: Cow::Borrowed(message),
         });
 
         let request = ChatRequest {
@@ -218,8 +219,8 @@ impl Provider for GlmProvider {
         let api_messages: Vec<Message> = messages
             .iter()
             .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
+                role: Cow::Borrowed(&m.role),
+                content: Cow::Borrowed(&m.content),
             })
             .collect();
 
@@ -232,7 +233,7 @@ impl Provider for GlmProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .json(&request)
@@ -264,7 +265,7 @@ impl Provider for GlmProvider {
         let url = format!("{}/chat/completions", self.base_url);
         // GET will likely return 405 but establishes the TLS + HTTP/2 connection pool.
         let _ = self
-            .client
+            .http_client()
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .send()
