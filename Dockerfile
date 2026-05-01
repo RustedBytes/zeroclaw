@@ -8,6 +8,9 @@ RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
 COPY web/ .
 RUN npm run build
 
+# ── Stage 0b: Minimal shell tools for distroless runtime ───────
+FROM busybox:1.37.0-musl AS busybox
+
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
@@ -166,6 +169,8 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc7564
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+COPY --from=busybox /bin/busybox /bin/sh
+COPY --from=busybox /bin/busybox /bin/wget
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
