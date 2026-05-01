@@ -1511,8 +1511,8 @@ mod native_backend {
                 );
             }
 
-            let mut builder =
-                ClientBuilder::rustls().context("Failed to initialize rustls connector")?;
+            let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+            let mut builder = ClientBuilder::new(connector);
             if !capabilities.is_empty() {
                 builder.capabilities(capabilities);
             }

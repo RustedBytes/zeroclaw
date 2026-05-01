@@ -20,7 +20,8 @@ directories = "6.0"
 futures-util = { version = "0.3", default-features = false }
 glob = "0.3"
 hex = "0.4"
-fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
+fantoccini = { version = "0.22.1", optional = true, default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
 nanohtml2text = "0.2"
 parking_lot = "0.12"
 pdf-extract = { version = "0.10", optional = true }
@@ -44,7 +45,7 @@ which = "8.0"
 
 [features]
 default = []
-browser-native = ["dep:fantoccini"]
+browser-native = ["dep:fantoccini", "dep:hyper-util"]
 rag-pdf = ["dep:pdf-extract"]
 probe = ["dep:probe-rs"]
 
