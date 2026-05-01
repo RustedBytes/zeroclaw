@@ -1,13 +1,17 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
+use futures_util::StreamExt;
 use parking_lot::Mutex;
+use reqwest::Body;
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode};
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -88,12 +92,25 @@ fn truncate_telegram_command_description(raw: &str) -> String {
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The effective per-chunk limit is reduced to leave room for continuation markers.
+#[cfg(test)]
 fn split_message_for_telegram(message: &str) -> Vec<String> {
+    split_message_ranges_for_telegram(message)
+        .into_iter()
+        .map(|range| message[range].to_string())
+        .collect()
+}
+
+fn split_message_ranges_for_telegram(message: &str) -> Vec<std::ops::Range<usize>> {
+    if message.is_empty() {
+        return std::iter::once(0..0).collect();
+    }
+
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-        return vec![message.to_string()];
+        return std::iter::once(0..message.len()).collect();
     }
 
     let mut chunks = Vec::new();
+    let mut offset = 0;
     let mut remaining = message;
     let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
 
@@ -101,7 +118,7 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
         // If the remainder fits within the full limit, take it all (last chunk
         // or single chunk — continuation overhead is at most 14 chars).
         if remaining.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-            chunks.push(remaining.to_string());
+            chunks.push(offset..message.len());
             break;
         }
 
@@ -134,11 +151,23 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
             }
         };
 
-        chunks.push(remaining[..chunk_end].to_string());
+        chunks.push(offset..offset + chunk_end);
+        offset += chunk_end;
         remaining = &remaining[chunk_end..];
     }
 
     chunks
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for part in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(part);
+    }
+    normalized
 }
 
 fn pick_uniform_index(len: usize) -> usize {
@@ -431,7 +460,7 @@ impl TelegramChannel {
             bot_token,
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
-            client: reqwest::Client::new(),
+            client: zeroclaw_config::schema::build_channel_proxy_client("channel.telegram", None),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -468,6 +497,10 @@ impl TelegramChannel {
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.client = zeroclaw_config::schema::build_channel_proxy_client(
+            "channel.telegram",
+            proxy_url.as_deref(),
+        );
         self.proxy_url = proxy_url;
         self
     }
@@ -582,10 +615,7 @@ impl TelegramChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
-            "channel.telegram",
-            self.proxy_url.as_deref(),
-        )
+        self.client.clone()
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -926,7 +956,7 @@ impl TelegramChannel {
     fn normalize_incoming_content(text: &str, bot_username: &str) -> Option<String> {
         let spans = Self::find_bot_mention_spans(text, bot_username);
         if spans.is_empty() {
-            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized = collapse_whitespace(text);
             return (!normalized.is_empty()).then_some(normalized);
         }
 
@@ -938,7 +968,7 @@ impl TelegramChannel {
         }
         normalized.push_str(&text[cursor..]);
 
-        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = collapse_whitespace(&normalized);
         (!normalized.is_empty()).then_some(normalized)
     }
 
@@ -1159,6 +1189,73 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// Download a Telegram CDN file directly to disk, enforcing Telegram's file
+    /// limit while streaming so attachments are not duplicated in memory.
+    async fn download_file_to_path(
+        &self,
+        file_path: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{file_path}",
+            self.bot_token
+        );
+        let resp = self
+            .http_client()
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to download Telegram file")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Telegram file download failed: {}", resp.status());
+        }
+
+        if let Some(len) = resp.content_length()
+            && len > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            anyhow::bail!(
+                "Telegram file download exceeds {} MB limit",
+                TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+            );
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut file = tokio::fs::File::create(local_path).await.with_context(|| {
+            format!(
+                "Failed to create Telegram attachment file: {}",
+                local_path.display()
+            )
+        })?;
+        let mut downloaded = 0u64;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read Telegram file download chunk")?;
+            downloaded += u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            if downloaded > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+                let _ = tokio::fs::remove_file(local_path).await;
+                anyhow::bail!(
+                    "Telegram file download exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                );
+            }
+            file.write_all(&chunk).await.with_context(|| {
+                format!(
+                    "Failed to write Telegram attachment file: {}",
+                    local_path.display()
+                )
+            })?;
+        }
+
+        file.flush().await.with_context(|| {
+            format!(
+                "Failed to flush Telegram attachment file: {}",
+                local_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// Extract (file_id, duration) from a voice or audio message.
     fn parse_voice_metadata(message: &serde_json::Value) -> Option<(String, u64)> {
         let voice = message.get("voice").or_else(|| message.get("audio"))?;
@@ -1294,14 +1391,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let file_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to download attachment: {e}");
-                return None;
-            }
-        };
-
         // Determine local filename
         let local_filename = match &attachment.file_name {
             Some(name) => name.clone(),
@@ -1313,8 +1402,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
 
         let local_path = save_dir.join(&local_filename);
-        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
+        if let Err(e) = self.download_file_to_path(&tg_file_path, &local_path).await {
+            tracing::warn!(
+                "Failed to download attachment to {}: {e}",
+                local_path.display()
+            );
             return None;
         }
 
@@ -1605,11 +1697,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
 
         // Format as blockquote with sender attribution
-        let quoted_lines: String = reply_text
-            .lines()
-            .map(|line| format!("> {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut quoted_lines =
+            String::with_capacity(reply_text.len() + reply_text.lines().count() * 2);
+        for (idx, line) in reply_text.lines().enumerate() {
+            if idx > 0 {
+                quoted_lines.push('\n');
+            }
+            quoted_lines.push_str("> ");
+            quoted_lines.push_str(line);
+        }
 
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
@@ -1911,11 +2007,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     fn escape_html(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&#39;")
+        let mut escaped = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
     }
 
     async fn send_text_chunks(
@@ -1924,13 +2027,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let chunks = split_message_for_telegram(message);
+        let chunks = split_message_ranges_for_telegram(message);
+        let multiple_chunks = chunks.len() > 1;
+        let last_index = chunks.len().saturating_sub(1);
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let text = if chunks.len() > 1 {
+            let chunk = &message[chunk.clone()];
+            let text = if multiple_chunks {
                 if index == 0 {
                     format!("{chunk}\n\n(continues...)")
-                } else if index == chunks.len() - 1 {
+                } else if index == last_index {
                     format!("(continued)\n\n{chunk}")
                 } else {
                     format!("(continued)\n\n{chunk}\n\n(continues...)")
@@ -1958,7 +2064,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .await?;
 
             if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
+                if index < last_index {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 continue;
@@ -1999,7 +2105,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 );
             }
 
-            if index < chunks.len() - 1 {
+            if index < last_index {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
@@ -2132,6 +2238,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
+    async fn multipart_file_part(file_path: &Path, fallback_name: &str) -> anyhow::Result<Part> {
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(fallback_name)
+            .to_string();
+        let file = tokio::fs::File::open(file_path).await?;
+        let stream = ReaderStream::new(file);
+        Ok(Part::stream(Body::wrap_stream(stream)).file_name(file_name))
+    }
+
     /// Send a document/file to a Telegram chat
     pub async fn send_document(
         &self,
@@ -2143,10 +2260,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("file");
-
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+            .unwrap_or("file")
+            .to_string();
+        let part = Self::multipart_file_part(file_path, "file").await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
@@ -2226,10 +2342,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("photo.jpg");
-
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+            .unwrap_or("photo.jpg")
+            .to_string();
+        let part = Self::multipart_file_part(file_path, "photo.jpg").await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
@@ -2309,10 +2424,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("video.mp4");
-
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+            .unwrap_or("video.mp4")
+            .to_string();
+        let part = Self::multipart_file_part(file_path, "video.mp4").await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
@@ -2353,10 +2467,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("audio.mp3");
-
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+            .unwrap_or("audio.mp3")
+            .to_string();
+        let part = Self::multipart_file_part(file_path, "audio.mp3").await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
@@ -2397,10 +2510,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("voice.ogg");
-
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+            .unwrap_or("voice.ogg")
+            .to_string();
+        let part = Self::multipart_file_part(file_path, "voice.ogg").await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
