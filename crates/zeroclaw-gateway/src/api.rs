@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 const MASKED_SECRET: &str = "***MASKED***";
 const RUNTIME_RESET_API_KEY_ENV: &str = "ZEROCLAW_RUNTIME_RESET_API_KEY";
+const RUNTIME_RESET_WARMUP_ATTEMPTS: usize = 5;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -898,29 +899,56 @@ pub async fn handle_api_runtime_reset(
 
     zeroclaw_config::schema::clear_runtime_proxy_client_cache();
 
-    let provider_warmup = match state.provider.warmup().await {
-        Ok(()) => {
-            tracing::info!("Runtime reset completed; provider warmup succeeded");
-            serde_json::json!({ "ok": true })
-        }
-        Err(error) => {
-            let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
-            tracing::warn!("Runtime reset completed; provider warmup failed: {error}");
-            serde_json::json!({
-                "ok": false,
-                "error": error,
-            })
-        }
-    };
+    let mut last_warmup_error = None;
+    for attempt in 1..=RUNTIME_RESET_WARMUP_ATTEMPTS {
+        match state.provider.warmup().await {
+            Ok(()) => {
+                tracing::info!(
+                    attempt,
+                    "Runtime reset completed; provider warmup succeeded"
+                );
+                return Json(serde_json::json!({
+                    "status": "ok",
+                    "reset": {
+                        "runtime_http_client_cache": "cleared",
+                        "provider_warmup": {
+                            "ok": true,
+                            "attempt": attempt,
+                        },
+                    }
+                }))
+                .into_response();
+            }
+            Err(error) => {
+                let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+                tracing::warn!(attempt, "Runtime reset provider warmup failed: {error}");
+                last_warmup_error = Some(error);
 
-    Json(serde_json::json!({
-        "status": "ok",
-        "reset": {
-            "runtime_http_client_cache": "cleared",
-            "provider_warmup": provider_warmup,
+                if attempt < RUNTIME_RESET_WARMUP_ATTEMPTS {
+                    let backoff_ms = 500_u64.saturating_mul(1 << (attempt - 1));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    zeroclaw_config::schema::clear_runtime_proxy_client_cache();
+                }
+            }
         }
-    }))
-    .into_response()
+    }
+
+    let error = last_warmup_error.unwrap_or_else(|| "provider warmup failed".to_string());
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "status": "error",
+            "reset": {
+                "runtime_http_client_cache": "cleared",
+                "provider_warmup": {
+                    "ok": false,
+                    "attempts": RUNTIME_RESET_WARMUP_ATTEMPTS,
+                    "error": error,
+                },
+            }
+        })),
+    )
+        .into_response()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────

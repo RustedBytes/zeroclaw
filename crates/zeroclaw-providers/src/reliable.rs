@@ -444,13 +444,28 @@ impl ReliableProvider {
 #[async_trait]
 impl Provider for ReliableProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
+        let mut failures = Vec::new();
+
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
-            if provider.warmup().await.is_err() {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal)");
+            match provider.warmup().await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let error_detail = compact_error_detail(&error);
+                    tracing::warn!(
+                        provider = name,
+                        error = %error_detail,
+                        "Warmup failed"
+                    );
+                    failures.push(format!("provider={name}: {error_detail}"));
+                }
             }
         }
-        Ok(())
+
+        anyhow::bail!(
+            "All provider warmups failed. Attempts:\n{}",
+            failures.join("\n")
+        )
     }
 
     async fn chat_with_system(
@@ -1345,6 +1360,30 @@ mod tests {
         }
     }
 
+    struct WarmupMockProvider {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Provider for WarmupMockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn warmup(&self) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("warmup failed");
+            }
+            Ok(())
+        }
+    }
+
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
@@ -1460,6 +1499,49 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_returns_ok_when_any_provider_succeeds() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "bad".to_string(),
+                    Box::new(WarmupMockProvider { fail: true }),
+                ),
+                (
+                    "good".to_string(),
+                    Box::new(WarmupMockProvider { fail: false }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(provider.warmup().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn warmup_returns_error_when_all_providers_fail() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "bad-a".to_string(),
+                    Box::new(WarmupMockProvider { fail: true }),
+                ),
+                (
+                    "bad-b".to_string(),
+                    Box::new(WarmupMockProvider { fail: true }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = provider.warmup().await.unwrap_err().to_string();
+        assert!(error.contains("All provider warmups failed"));
+        assert!(error.contains("provider=bad-a"));
+        assert!(error.contains("provider=bad-b"));
     }
 
     #[tokio::test]
