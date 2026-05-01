@@ -4572,13 +4572,17 @@ pub fn apply_runtime_proxy_to_builder(
 /// Apply outbound HTTP defaults that keep long-running daemon clients robust
 /// across process checkpoint/restore.
 ///
-/// CRIU-style restores can leave pooled TCP/TLS connections looking reusable to
-/// the process even though the peer/network path has moved on. Keeping no idle
-/// connections avoids repeatedly retrying against stale restored sockets.
+/// CRIU-style restores can leave pooled HTTP/2 state looking reusable to the
+/// process even though the peer/network path has moved on. Keeping clients on
+/// HTTP/1.1 avoids restored HTTP/2 session state, while one idle connection per
+/// host lets startup warmup bridge short post-restore DNS outages.
 pub fn apply_checkpoint_resilient_http_defaults(
     builder: reqwest::ClientBuilder,
 ) -> reqwest::ClientBuilder {
-    builder.pool_max_idle_per_host(0)
+    builder
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(std::time::Duration::from_secs(600))
+        .http1_only()
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
@@ -4594,6 +4598,22 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
     client
+}
+
+pub fn build_runtime_proxy_client_fresh(service_key: &str) -> reqwest::Client {
+    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
+    builder.build().unwrap_or_else(|error| {
+        tracing::warn!(service_key, "Failed to build fresh proxied client: {error}");
+        apply_checkpoint_resilient_http_defaults(reqwest::Client::builder())
+            .build()
+            .unwrap_or_else(|fallback_error| {
+                tracing::warn!(
+                    service_key,
+                    "Failed to build fresh fallback client: {fallback_error}"
+                );
+                reqwest::Client::new()
+            })
+    })
 }
 
 pub fn build_runtime_proxy_client_with_timeouts(
@@ -4629,6 +4649,58 @@ pub fn build_channel_proxy_client(service_key: &str, proxy_url: Option<&str>) ->
     match normalize_proxy_url_option(proxy_url) {
         Some(url) => build_explicit_proxy_client(service_key, &url, None, None),
         None => build_runtime_proxy_client(service_key),
+    }
+}
+
+/// Build a fresh HTTP client for a channel without using the shared runtime
+/// client cache. Long-polling channels use this to avoid carrying restored
+/// in-flight/pool state across container checkpoint boundaries.
+pub fn build_channel_proxy_client_fresh(
+    service_key: &str,
+    proxy_url: Option<&str>,
+) -> reqwest::Client {
+    match normalize_proxy_url_option(proxy_url) {
+        Some(url) => build_explicit_proxy_client_fresh(service_key, &url, None, None),
+        None => build_runtime_proxy_client_fresh(service_key),
+    }
+}
+
+pub fn build_channel_proxy_client_fresh_with_timeouts(
+    service_key: &str,
+    proxy_url: Option<&str>,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    match normalize_proxy_url_option(proxy_url) {
+        Some(url) => build_explicit_proxy_client_fresh(
+            service_key,
+            &url,
+            Some(timeout_secs),
+            Some(connect_timeout_secs),
+        ),
+        None => {
+            let builder = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+            let builder = apply_runtime_proxy_to_builder(builder, service_key);
+            builder.build().unwrap_or_else(|error| {
+                tracing::warn!(
+                    service_key,
+                    "Failed to build fresh timeout proxied client: {error}"
+                );
+                apply_checkpoint_resilient_http_defaults(reqwest::Client::builder())
+                    .timeout(std::time::Duration::from_secs(timeout_secs))
+                    .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+                    .build()
+                    .unwrap_or_else(|fallback_error| {
+                        tracing::warn!(
+                            service_key,
+                            "Failed to build fresh timeout fallback client: {fallback_error}"
+                        );
+                        reqwest::Client::new()
+                    })
+            })
+        }
     }
 }
 
@@ -4709,6 +4781,39 @@ fn build_explicit_proxy_client(
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
     client
+}
+
+fn build_explicit_proxy_client_fresh(
+    service_key: &str,
+    proxy_url: &str,
+    timeout_secs: Option<u64>,
+    connect_timeout_secs: Option<u64>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(t) = timeout_secs {
+        builder = builder.timeout(std::time::Duration::from_secs(t));
+    }
+    if let Some(ct) = connect_timeout_secs {
+        builder = builder.connect_timeout(std::time::Duration::from_secs(ct));
+    }
+    builder = apply_explicit_proxy_to_builder(builder, service_key, proxy_url);
+    builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            proxy_url,
+            "Failed to build fresh channel proxy client: {error}"
+        );
+        apply_checkpoint_resilient_http_defaults(reqwest::Client::builder())
+            .build()
+            .unwrap_or_else(|fallback_error| {
+                tracing::warn!(
+                    service_key,
+                    proxy_url,
+                    "Failed to build fresh fallback channel client: {fallback_error}"
+                );
+                reqwest::Client::new()
+            })
+    })
 }
 
 /// Apply a single explicit proxy URL to a builder via `Proxy::all`.

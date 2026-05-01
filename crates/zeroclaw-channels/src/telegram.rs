@@ -26,6 +26,9 @@ const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "�
 /// Telegram Bot API getUpdates returns at most 100 updates unless a lower limit is requested.
 const TELEGRAM_MAX_POLLED_UPDATES: usize = 100;
 const TELEGRAM_API_DESCRIPTION_BUF_LEN: usize = 256;
+const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
+const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_POLL_TIMEOUT_SECS + 10;
+const TELEGRAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +95,65 @@ fn parse_telegram_poll_summary(input: &str) -> fixed_json::Result<TelegramPollSu
         description,
         max_update_id,
     })
+}
+
+fn copy_cstr_truncated(target: &mut [u8], value: &str) {
+    if target.is_empty() {
+        return;
+    }
+
+    let max = target.len().saturating_sub(1);
+    let mut end = value.len().min(max);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    target[..end].copy_from_slice(&value.as_bytes()[..end]);
+}
+
+fn parse_telegram_poll_summary_serde(input: &str) -> serde_json::Result<TelegramPollSummary> {
+    let data: serde_json::Value = serde_json::from_str(input)?;
+    let ok = data
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let error_code = data
+        .get("error_code")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or_default();
+    let mut description = [0u8; TELEGRAM_API_DESCRIPTION_BUF_LEN];
+    if let Some(value) = data.get("description").and_then(serde_json::Value::as_str) {
+        copy_cstr_truncated(&mut description, value);
+    }
+
+    let max_update_id = data
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|updates| {
+            updates
+                .iter()
+                .filter_map(|update| update.get("update_id").and_then(serde_json::Value::as_i64))
+                .max()
+        });
+
+    Ok(TelegramPollSummary {
+        ok,
+        error_code,
+        description,
+        max_update_id,
+    })
+}
+
+fn parse_telegram_poll_summary_lenient(input: &str) -> serde_json::Result<TelegramPollSummary> {
+    match parse_telegram_poll_summary(input) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            tracing::debug!(
+                "Telegram fixed-json summary parse failed; falling back to serde_json: {error}"
+            );
+            parse_telegram_poll_summary_serde(input)
+        }
+    }
 }
 
 /// The kind of incoming attachment (document vs photo).
@@ -521,7 +583,7 @@ impl TelegramChannel {
             bot_token,
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
-            client: zeroclaw_config::schema::build_channel_proxy_client("channel.telegram", None),
+            client: Self::build_http_client(None),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -558,10 +620,7 @@ impl TelegramChannel {
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
-        self.client = zeroclaw_config::schema::build_channel_proxy_client(
-            "channel.telegram",
-            proxy_url.as_deref(),
-        );
+        self.client = Self::build_http_client(proxy_url.as_deref());
         self.proxy_url = proxy_url;
         self
     }
@@ -658,7 +717,7 @@ impl TelegramChannel {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
-                    let err = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    let err = TelegramChannel::sanitize_http_error(&err);
                     tracing::warn!(
                         "Telegram: failed to add ACK reaction to chat_id={chat_id}, message_id={message_id}: {err}"
                     );
@@ -678,6 +737,26 @@ impl TelegramChannel {
 
     fn http_client(&self) -> reqwest::Client {
         self.client.clone()
+    }
+
+    fn build_http_client(proxy_url: Option<&str>) -> reqwest::Client {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(TELEGRAM_CONNECT_TIMEOUT_SECS))
+            .http1_only()
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(600));
+        let builder = zeroclaw_config::schema::apply_channel_proxy_to_builder(
+            builder,
+            "channel.telegram",
+            proxy_url,
+        )
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(Duration::from_secs(600));
+        builder.build().unwrap_or_else(|error| {
+            tracing::warn!("Failed to build Telegram HTTP client: {error}");
+            reqwest::Client::new()
+        })
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -769,8 +848,15 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
-    fn sanitize_http_error(error: &impl std::fmt::Display) -> String {
-        zeroclaw_providers::sanitize_api_error(&error.to_string())
+    fn sanitize_http_error(error: &(dyn std::error::Error + 'static)) -> String {
+        let mut detail = error.to_string();
+        let mut source = error.source();
+        while let Some(error) = source {
+            detail.push_str(": ");
+            detail.push_str(&error.to_string());
+            source = error.source();
+        }
+        zeroclaw_providers::sanitize_api_error(&detail)
     }
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
@@ -2751,7 +2837,7 @@ impl Channel for TelegramChannel {
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -2825,7 +2911,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -2874,7 +2960,7 @@ impl Channel for TelegramChannel {
             // Delete the draft message
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -2903,7 +2989,7 @@ impl Channel for TelegramChannel {
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -2934,7 +3020,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -2958,7 +3044,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
@@ -2975,7 +3061,7 @@ impl Channel for TelegramChannel {
         }
 
         let delete_resp = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -3018,7 +3104,7 @@ impl Channel for TelegramChannel {
         };
 
         let response = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -3171,7 +3257,8 @@ impl Channel for TelegramChannel {
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
-                    tracing::warn!("Telegram startup probe error: {e}; retrying in 5s");
+                    let error = Self::sanitize_http_error(&e);
+                    tracing::warn!("Telegram startup probe error: {error}; retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Ok(resp) => {
@@ -3182,10 +3269,10 @@ impl Channel for TelegramChannel {
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
-                        Ok(data) => match parse_telegram_poll_summary(&data) {
+                        Ok(data) => match parse_telegram_poll_summary_lenient(&data) {
                             Err(e) => {
                                 tracing::warn!(
-                                    "Telegram startup probe fixed-json parse error: {e}; retrying in 5s"
+                                    "Telegram startup probe response parse error: {e}; retrying in 5s"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             }
@@ -3233,7 +3320,7 @@ impl Channel for TelegramChannel {
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
-                "timeout": 30,
+                "timeout": TELEGRAM_POLL_TIMEOUT_SECS,
                 "allowed_updates": ["message", "callback_query"]
             });
 
@@ -3256,7 +3343,7 @@ impl Channel for TelegramChannel {
                 }
             };
 
-            match parse_telegram_poll_summary(&data) {
+            match parse_telegram_poll_summary_lenient(&data) {
                 Ok(summary) if !summary.ok => {
                     let error_code = i64::from(summary.error_code);
                     let description = fixed_json::cstr(&summary.description);
@@ -3286,9 +3373,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::debug!(
-                        "Telegram fixed-json summary parse failed; falling back to serde_json: {e}"
-                    );
+                    tracing::debug!("Telegram poll summary parse failed: {e}");
                 }
             }
 
@@ -3616,6 +3701,27 @@ mod tests {
             "Conflict: terminated by other getUpdates request"
         );
         assert_eq!(summary.max_update_id, None);
+    }
+
+    #[test]
+    fn telegram_poll_summary_lenient_accepts_empty_result_array() {
+        let summary = parse_telegram_poll_summary_lenient(r#"{"ok":true,"result":[]}"#)
+            .expect("empty Telegram result array should parse");
+
+        assert!(summary.ok);
+        assert_eq!(summary.error_code, 0);
+        assert_eq!(summary.max_update_id, None);
+    }
+
+    #[test]
+    fn telegram_poll_summary_lenient_tracks_max_update_id() {
+        let summary = parse_telegram_poll_summary_lenient(
+            r#"{"ok":true,"result":[{"update_id":10,"message":{"entities":[]}},{"update_id":12,"callback_query":{"message":{"photo":[]}}}]}"#,
+        )
+        .expect("Telegram result with nested arrays should parse");
+
+        assert!(summary.ok);
+        assert_eq!(summary.max_update_id, Some(12));
     }
 
     #[test]

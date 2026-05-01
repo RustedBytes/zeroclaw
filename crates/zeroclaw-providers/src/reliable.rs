@@ -305,7 +305,15 @@ fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
 }
 
 fn compact_error_detail(err: &anyhow::Error) -> String {
-    super::sanitize_api_error(&err.to_string())
+    let mut detail = err.to_string();
+    let mut source = err.source();
+    while let Some(error) = source {
+        detail.push_str(": ");
+        detail.push_str(&error.to_string());
+        source = error.source();
+    }
+
+    super::sanitize_api_error(&detail)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1538,6 +1546,20 @@ mod tests {
         assert!(!is_auth_error(&anyhow::anyhow!("429 Too Many Requests")));
         assert!(!is_auth_error(&anyhow::anyhow!("timeout")));
         assert!(!is_auth_error(&anyhow::anyhow!("connection reset")));
+    }
+
+    #[test]
+    fn compact_error_detail_includes_source_chain() {
+        let err = anyhow::anyhow!("Temporary failure in name resolution")
+            .context("dns error")
+            .context(
+                "error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)",
+            );
+
+        let detail = compact_error_detail(&err);
+        assert!(detail.contains("error sending request"));
+        assert!(detail.contains("dns error"));
+        assert!(detail.contains("Temporary failure in name resolution"));
     }
 
     #[tokio::test]
