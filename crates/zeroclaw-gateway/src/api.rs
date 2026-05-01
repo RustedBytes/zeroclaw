@@ -1758,7 +1758,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::Provider;
@@ -1885,9 +1885,9 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
-    fn env_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct EnvVarGuard {
@@ -1920,7 +1920,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_reset_clears_http_cache_and_warms_provider() {
-        let _env_lock = env_lock().lock().unwrap();
+        let _env_lock = env_lock().lock().await;
         let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", "reset-key".parse().unwrap());
@@ -1942,7 +1942,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_reset_accepts_env_api_key_when_pairing_enabled() {
-        let _env_lock = env_lock().lock().unwrap();
+        let _env_lock = env_lock().lock().await;
         let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
 
         let mut state = test_state(zeroclaw_config::schema::Config::default());
@@ -1960,7 +1960,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_reset_rejects_wrong_env_api_key() {
-        let _env_lock = env_lock().lock().unwrap();
+        let _env_lock = env_lock().lock().await;
         let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
 
         let mut state = test_state(zeroclaw_config::schema::Config::default());
@@ -1978,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_reset_reports_missing_env_api_key() {
-        let _env_lock = env_lock().lock().unwrap();
+        let _env_lock = env_lock().lock().await;
         let _env = EnvVarGuard::unset(RUNTIME_RESET_API_KEY_ENV);
 
         let mut headers = HeaderMap::new();

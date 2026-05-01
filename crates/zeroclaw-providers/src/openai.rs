@@ -329,8 +329,9 @@ impl OpenAiProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_timeouts(
             "provider.openai",
+            &self.base_url,
             120,
             10,
         )

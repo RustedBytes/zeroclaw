@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -16,13 +17,18 @@ use zeroclaw_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.anthropic",
+    "provider.auth",
+    "provider.azure_openai",
+    "provider.bedrock",
     "provider.compatible",
     "provider.copilot",
     "provider.gemini",
     "provider.glm",
     "provider.ollama",
     "provider.openai",
+    "provider.openai_codex",
     "provider.openrouter",
+    "provider.telnyx",
     "channel.dingtalk",
     "channel.discord",
     "channel.feishu",
@@ -58,6 +64,8 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
+    OnceLock::new();
+static RUNTIME_RESOLVED_HOST_CACHE: OnceLock<RwLock<HashMap<String, Vec<SocketAddr>>>> =
     OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
@@ -4490,6 +4498,10 @@ fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Clie
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn runtime_resolved_host_cache() -> &'static RwLock<HashMap<String, Vec<SocketAddr>>> {
+    RUNTIME_RESOLVED_HOST_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 /// Drop cached reqwest clients built from runtime proxy settings.
 ///
 /// This is called when proxy settings change and during daemon shutdown so
@@ -4503,6 +4515,139 @@ pub fn clear_runtime_proxy_client_cache() {
         Err(poisoned) => {
             *poisoned.into_inner() = HashMap::new();
         }
+    }
+}
+
+fn provider_service_host_port(service_key: &str) -> Option<(&'static str, u16)> {
+    match service_key.trim().to_ascii_lowercase().as_str() {
+        "provider.anthropic" => Some(("api.anthropic.com", 443)),
+        "provider.copilot" => Some(("api.github.com", 443)),
+        "provider.gemini" => Some(("generativelanguage.googleapis.com", 443)),
+        "provider.glm" => Some(("open.bigmodel.cn", 443)),
+        "provider.openai" => Some(("api.openai.com", 443)),
+        "provider.openrouter" => Some(("openrouter.ai", 443)),
+        "provider.telnyx" => Some(("api.telnyx.com", 443)),
+        _ => None,
+    }
+}
+
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default()?;
+    Some((host, port))
+}
+
+fn cached_resolved_host(cache_key: &str) -> Option<Vec<SocketAddr>> {
+    match runtime_resolved_host_cache().read() {
+        Ok(guard) => guard.get(cache_key).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(cache_key).cloned(),
+    }
+}
+
+fn set_cached_resolved_host(cache_key: String, addrs: Vec<SocketAddr>) {
+    match runtime_resolved_host_cache().write() {
+        Ok(mut guard) => {
+            guard.insert(cache_key, addrs);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(cache_key, addrs);
+        }
+    }
+}
+
+fn apply_cached_dns_for_service(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> reqwest::ClientBuilder {
+    let Some((host, port)) = provider_service_host_port(service_key) else {
+        return builder;
+    };
+
+    apply_cached_dns_for_host_port(builder, service_key, host, port)
+}
+
+fn apply_cached_dns_for_url(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+    url: &str,
+) -> reqwest::ClientBuilder {
+    let Some((host, port)) = url_host_port(url) else {
+        return builder;
+    };
+
+    apply_cached_dns_for_host_port(builder, service_key, &host, port)
+}
+
+pub fn apply_cached_dns_to_builder_for_url(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+    url: &str,
+) -> reqwest::ClientBuilder {
+    apply_cached_dns_for_url(builder, service_key, url)
+}
+
+pub fn runtime_resolved_addrs_for_url(
+    service_key: &str,
+    url: &str,
+) -> Option<(String, Vec<SocketAddr>)> {
+    let (host, port) = url_host_port(url)?;
+    resolved_addrs_for_host_port(service_key, &host, port).map(|addrs| (host, addrs))
+}
+
+fn apply_cached_dns_for_host_port(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+    host: &str,
+    port: u16,
+) -> reqwest::ClientBuilder {
+    match resolved_addrs_for_host_port(service_key, host, port) {
+        Some(addrs) => builder.resolve_to_addrs(host, &addrs),
+        None => builder,
+    }
+}
+
+fn resolved_addrs_for_host_port(
+    service_key: &str,
+    host: &str,
+    port: u16,
+) -> Option<Vec<SocketAddr>> {
+    let cache_key = format!("{host}:{port}");
+    match std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) {
+        Ok(addrs) => {
+            let addrs = addrs.collect::<Vec<_>>();
+            if addrs.is_empty() {
+                return cached_resolved_host(&cache_key);
+            }
+
+            set_cached_resolved_host(cache_key, addrs.clone());
+            tracing::debug!(
+                service_key,
+                host,
+                resolved_addrs = addrs.len(),
+                "Pinned provider DNS resolution"
+            );
+            Some(addrs)
+        }
+        Err(error) => match cached_resolved_host(&cache_key) {
+            Some(cached) => {
+                tracing::warn!(
+                    service_key,
+                    host,
+                    resolved_addrs = cached.len(),
+                    "Provider DNS resolution failed; using cached addresses: {error}"
+                );
+                Some(cached)
+            }
+            None => {
+                tracing::warn!(
+                    service_key,
+                    host,
+                    "Provider DNS resolution failed and no cached addresses are available: {error}"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -4562,6 +4707,14 @@ pub fn runtime_proxy_config() -> ProxyConfig {
 }
 
 pub fn apply_runtime_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> reqwest::ClientBuilder {
+    let builder = apply_runtime_proxy_settings_to_builder(builder, service_key);
+    apply_cached_dns_for_service(builder, service_key)
+}
+
+pub fn apply_runtime_proxy_settings_to_builder(
     builder: reqwest::ClientBuilder,
     service_key: &str,
 ) -> reqwest::ClientBuilder {
@@ -4635,6 +4788,69 @@ pub fn build_runtime_proxy_client_with_timeouts(
         tracing::warn!(
             service_key,
             "Failed to build proxied timeout client: {error}"
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+pub fn build_runtime_proxy_client_for_url_with_timeouts(
+    service_key: &str,
+    base_url: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    build_runtime_proxy_client_for_url_with_optional_timeouts(
+        service_key,
+        base_url,
+        Some(timeout_secs),
+        connect_timeout_secs,
+        None,
+    )
+}
+
+pub fn build_runtime_proxy_client_for_url_with_optional_timeouts(
+    service_key: &str,
+    base_url: &str,
+    timeout_secs: Option<u64>,
+    connect_timeout_secs: u64,
+    read_timeout_secs: Option<u64>,
+) -> reqwest::Client {
+    let url_cache_key = url_host_port(base_url)
+        .map(|(host, port)| format!("{host}:{port}"))
+        .unwrap_or_else(|| "none".to_string());
+    let cache_key = format!(
+        "{}|url={}|timeout={}|connect_timeout={}|read_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        url_cache_key,
+        timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        connect_timeout_secs,
+        read_timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+    if let Some(timeout_secs) = timeout_secs {
+        builder = builder.timeout(std::time::Duration::from_secs(timeout_secs));
+    }
+    if let Some(read_timeout_secs) = read_timeout_secs {
+        builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    }
+    let builder = apply_runtime_proxy_settings_to_builder(builder, service_key);
+    let builder = apply_cached_dns_for_url(builder, service_key, base_url);
+    let client = builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            base_url,
+            "Failed to build proxied timeout client for URL: {error}"
         );
         reqwest::Client::new()
     });
@@ -11767,9 +11983,9 @@ mod tests {
         assert!(msg.contains("zeroclaw"));
     }
 
+    #[cfg(feature = "schema-export")]
     #[test]
     async fn config_schema_export_contains_expected_contract_shape() {
-        #[cfg(feature = "schema-export")]
         let schema = schemars::schema_for!(Config);
         let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
 

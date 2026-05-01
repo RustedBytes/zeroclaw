@@ -54,11 +54,12 @@ impl TelnyxProvider {
         let resolved_key = resolve_telnyx_api_key(api_key);
         Self {
             api_key: resolved_key,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_timeouts(
+                "provider.telnyx",
+                BASE_URL,
+                120,
+                10,
+            ),
         }
     }
 

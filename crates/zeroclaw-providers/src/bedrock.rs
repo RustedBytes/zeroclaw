@@ -525,8 +525,14 @@ impl BedrockProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let region = match self.auth {
+            Some(BedrockAuth::SigV4(ref creds)) => creds.region.clone(),
+            _ => Self::resolve_region(),
+        };
+        let base_url = format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/");
+        zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_timeouts(
             "provider.bedrock",
+            &base_url,
             120,
             10,
         )

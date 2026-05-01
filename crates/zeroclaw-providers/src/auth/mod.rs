@@ -4,7 +4,7 @@ pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
 
-use crate::auth::openai_oauth::refresh_access_token;
+use crate::auth::openai_oauth::{OPENAI_OAUTH_TOKEN_URL, refresh_access_token};
 use crate::auth::profiles::{
     AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
 };
@@ -38,9 +38,33 @@ impl AuthService {
     }
 
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
+        let client = {
+            let builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(10));
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_settings_to_builder(
+                builder,
+                "provider.auth",
+            );
+            let builder = zeroclaw_config::schema::apply_cached_dns_to_builder_for_url(
+                builder,
+                "provider.auth",
+                OPENAI_OAUTH_TOKEN_URL,
+            );
+            let builder = zeroclaw_config::schema::apply_cached_dns_to_builder_for_url(
+                builder,
+                "provider.auth",
+                gemini_oauth::GOOGLE_OAUTH_TOKEN_URL,
+            );
+            builder.build().unwrap_or_else(|error| {
+                tracing::warn!("Failed to build auth HTTP client: {error}");
+                reqwest::Client::new()
+            })
+        };
+
         Self {
             store: AuthProfilesStore::new(state_dir, encrypt_secrets),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

@@ -285,6 +285,33 @@ fn read_non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn build_blocking_runtime_client_for_url(
+    service_key: &str,
+    url: &str,
+) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(std::time::Duration::from_secs(600))
+        .http1_only();
+
+    if let Some((host, addrs)) =
+        zeroclaw_config::schema::runtime_resolved_addrs_for_url(service_key, url)
+    {
+        builder = builder.resolve_to_addrs(&host, &addrs);
+    }
+
+    builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            url,
+            "Failed to build blocking runtime HTTP client: {error}"
+        );
+        reqwest::blocking::Client::new()
+    })
+}
+
 fn is_minimax_oauth_placeholder(value: &str) -> bool {
     value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER)
         || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
@@ -376,11 +403,8 @@ fn qwen_oauth_token_expired(credentials: &QwenOauthCredentials) -> bool {
 
 fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
     let client_id = qwen_oauth_client_id();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    let client =
+        build_blocking_runtime_client_for_url("provider.compatible", QWEN_OAUTH_TOKEN_ENDPOINT);
 
     let response = client
         .post(QWEN_OAUTH_TOKEN_ENDPOINT)
@@ -546,11 +570,7 @@ fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow
     let region = minimax_oauth_region(name);
     let endpoint = region.token_endpoint();
     let client_id = minimax_oauth_client_id();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    let client = build_blocking_runtime_client_for_url("provider.compatible", endpoint);
 
     let response = client
         .post(endpoint)

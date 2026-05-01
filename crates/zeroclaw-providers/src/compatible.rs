@@ -361,9 +361,14 @@ impl OpenAiCompatibleProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_settings_to_builder(
                 builder,
                 "provider.compatible",
+            );
+            let builder = zeroclaw_config::schema::apply_cached_dns_to_builder_for_url(
+                builder,
+                "provider.compatible",
+                &self.base_url,
             );
 
             return builder.build().unwrap_or_else(|error| {
@@ -374,8 +379,9 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_timeouts(
             "provider.compatible",
+            &self.base_url,
             timeout,
             10,
         )

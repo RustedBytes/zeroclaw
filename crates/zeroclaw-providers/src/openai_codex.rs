@@ -101,6 +101,14 @@ impl OpenAiCodexProvider {
             .unwrap_or_else(default_zeroclaw_dir);
         let auth = AuthService::new(&state_dir, options.secrets_encrypt);
         let responses_url = resolve_responses_url(options)?;
+        let client =
+            zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_optional_timeouts(
+                "provider.openai_codex",
+                &responses_url,
+                None,
+                10,
+                Some(300),
+            );
 
         Ok(Self {
             auth,
@@ -109,11 +117,7 @@ impl OpenAiCodexProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
         })
     }
 }

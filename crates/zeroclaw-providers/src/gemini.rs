@@ -378,11 +378,8 @@ fn refresh_gemini_cli_token(
     client_id: Option<&str>,
     client_secret: Option<&str>,
 ) -> anyhow::Result<RefreshedToken> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    let client =
+        crate::build_blocking_runtime_client_for_url("provider.gemini", GOOGLE_TOKEN_ENDPOINT);
 
     let form = build_oauth_refresh_form(refresh_token, client_id, client_secret);
 
@@ -870,8 +867,15 @@ impl GeminiProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let base_url = if self.auth.as_ref().is_some_and(GeminiAuth::is_oauth) {
+            CLOUDCODE_PA_ENDPOINT
+        } else {
+            BASE_URL
+        };
+
+        zeroclaw_config::schema::build_runtime_proxy_client_for_url_with_timeouts(
             "provider.gemini",
+            base_url,
             120,
             10,
         )

@@ -111,12 +111,12 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 /// sockets, and TLS caches instead of keeping them alive for the process lifetime.
 /// Daemon restart is still required to pick up channel-config changes; there is
 /// no in-flight refresh path.
-static CRON_CHANNEL_REGISTRY: OnceLock<
-    std::sync::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>>,
-> = OnceLock::new();
+type ChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
+type CronChannelRegistrySlot = std::sync::RwLock<Option<ChannelRegistry>>;
 
-fn cron_channel_registry_slot()
--> &'static std::sync::RwLock<Option<Arc<HashMap<String, Arc<dyn Channel>>>>> {
+static CRON_CHANNEL_REGISTRY: OnceLock<CronChannelRegistrySlot> = OnceLock::new();
+
+fn cron_channel_registry_slot() -> &'static CronChannelRegistrySlot {
     CRON_CHANNEL_REGISTRY.get_or_init(|| std::sync::RwLock::new(None))
 }
 
