@@ -1005,7 +1005,7 @@ pub async fn run_gateway(
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
-        .route("/api/runtime/reset", post(api::handle_api_runtime_reset))
+        .route("/api/runtime/reset", get(api::handle_api_runtime_reset))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(

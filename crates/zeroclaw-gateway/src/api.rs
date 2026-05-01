@@ -9,8 +9,10 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 
 const MASKED_SECRET: &str = "***MASKED***";
+const RUNTIME_RESET_API_KEY_ENV: &str = "ZEROCLAW_RUNTIME_RESET_API_KEY";
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -39,6 +41,60 @@ pub(super) fn require_auth(
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ))
+    }
+}
+
+fn extract_runtime_reset_request_key<'a>(
+    headers: &'a HeaderMap,
+    query: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    query
+        .get("api_key")
+        .map(String::as_str)
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .or_else(|| extract_bearer_token(headers))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn runtime_reset_api_key_from_env() -> Option<String> {
+    std::env::var(RUNTIME_RESET_API_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn require_runtime_reset_api_key(
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(configured_key) = runtime_reset_api_key_from_env() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("{RUNTIME_RESET_API_KEY_ENV} is not configured")
+            })),
+        ));
+    };
+
+    let Some(provided_key) = extract_runtime_reset_request_key(headers, query) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — provide the runtime reset api key via X-Api-Key, Authorization: Bearer <api_key>, or ?api_key="
+            })),
+        ));
+    };
+
+    if zeroclaw_runtime::security::pairing::constant_time_eq(&configured_key, provided_key) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — provided api_key does not match the configured runtime reset key"
             })),
         ))
     }
@@ -830,12 +886,13 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
-/// POST /api/runtime/reset — reset process-local runtime state after container restore.
+/// GET /api/runtime/reset — reset process-local runtime state after container restore.
 pub async fn handle_api_runtime_reset(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_runtime_reset_api_key(&headers, &query) {
         return e.into_response();
     }
 
@@ -1673,7 +1730,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::time::Duration;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::Provider;
@@ -1800,11 +1857,50 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[tokio::test]
     async fn runtime_reset_clears_http_cache_and_warms_provider() {
+        let _env_lock = env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "reset-key".parse().unwrap());
+
         let response = handle_api_runtime_reset(
             State(test_state(zeroclaw_config::schema::Config::default())),
-            HeaderMap::new(),
+            headers,
+            Query(HashMap::new()),
         )
         .await
         .into_response();
@@ -1814,6 +1910,61 @@ mod tests {
         assert_eq!(body["status"], "ok");
         assert_eq!(body["reset"]["runtime_http_client_cache"], "cleared");
         assert_eq!(body["reset"]["provider_warmup"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_accepts_env_api_key_when_pairing_enabled() {
+        let _env_lock = env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "reset-key".parse().unwrap());
+
+        let response = handle_api_runtime_reset(State(state), headers, Query(HashMap::new()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_rejects_wrong_env_api_key() {
+        let _env_lock = env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(RUNTIME_RESET_API_KEY_ENV, "reset-key");
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "wrong-key".parse().unwrap());
+
+        let response = handle_api_runtime_reset(State(state), headers, Query(HashMap::new()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_reports_missing_env_api_key() {
+        let _env_lock = env_lock().lock().unwrap();
+        let _env = EnvVarGuard::unset(RUNTIME_RESET_API_KEY_ENV);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "reset-key".parse().unwrap());
+
+        let response = handle_api_runtime_reset(
+            State(test_state(zeroclaw_config::schema::Config::default())),
+            headers,
+            Query(HashMap::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
