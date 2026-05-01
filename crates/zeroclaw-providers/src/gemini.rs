@@ -11,6 +11,7 @@ use base64::Engine;
 use directories::UserDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -82,11 +83,11 @@ impl GeminiAuth {
 // API REQUEST/RESPONSE TYPES
 // ══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, Clone)]
-struct GenerateContentRequest {
-    contents: Vec<Content>,
+#[derive(Debug, Serialize)]
+struct GenerateContentRequest<'a> {
+    contents: Vec<Content<'a>>,
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<Content>,
+    system_instruction: Option<Content<'a>>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
 }
@@ -108,61 +109,65 @@ struct GenerateContentRequest {
 /// ```
 /// Ref: gemini-cli `packages/core/src/code_assist/converter.ts`
 #[derive(Debug, Serialize)]
-struct InternalGenerateContentEnvelope {
+struct InternalGenerateContentEnvelope<'a> {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
+    project: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_prompt_id: Option<String>,
-    request: InternalGenerateContentRequest,
+    request: InternalGenerateContentRequest<'a>,
 }
 
 /// Nested request payload for cloudcode-pa's code assist APIs.
 #[derive(Debug, Serialize)]
-struct InternalGenerateContentRequest {
-    contents: Vec<Content>,
+struct InternalGenerateContentRequest<'a> {
+    contents: &'a [Content<'a>],
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<Content>,
+    system_instruction: Option<&'a Content<'a>>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
-    generation_config: Option<GenerationConfig>,
+    generation_config: Option<&'a GenerationConfig>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct Content {
+#[derive(Debug, Serialize)]
+struct Content<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<String>,
-    parts: Vec<Part>,
+    role: Option<Cow<'a, str>>,
+    parts: Vec<Part<'a>>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum Part {
-    Text { text: String },
-    Inline { inline_data: InlineData },
+enum Part<'a> {
+    Text { text: Cow<'a, str> },
+    Inline { inline_data: InlineData<'a> },
 }
 
-impl Part {
-    fn text(s: impl Into<String>) -> Self {
+impl<'a> Part<'a> {
+    fn text(s: impl Into<Cow<'a, str>>) -> Self {
         Part::Text { text: s.into() }
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct InlineData {
-    mime_type: String,
-    data: String,
+#[derive(Debug, Serialize)]
+struct InlineData<'a> {
+    mime_type: Cow<'a, str>,
+    data: Cow<'a, str>,
 }
 
 /// Build Gemini Parts from a message content string.
 /// If the content contains [IMAGE:data:...] markers (already normalized by the
 /// multimodal pipeline), they are extracted as inline_data parts. The remaining
 /// text becomes a text part. Falls back to a single text part if no markers.
-fn build_parts(content: &str) -> Vec<Part> {
+fn build_parts(content: &str) -> Vec<Part<'_>> {
     let (text, image_refs) = crate::multimodal::parse_image_markers(content);
-    let mut parts = Vec::new();
+    if image_refs.is_empty() {
+        return vec![Part::text(content)];
+    }
+
+    let mut parts = Vec::with_capacity(image_refs.len() + 1);
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        parts.push(Part::text(trimmed));
+        parts.push(Part::text(Cow::Owned(trimmed.to_string())));
     }
     for uri in &image_refs {
         if let Some(rest) = uri.strip_prefix("data:")
@@ -172,15 +177,15 @@ fn build_parts(content: &str) -> Vec<Part> {
             if let Some(b64) = rest[semi_pos + 1..].strip_prefix("base64,") {
                 parts.push(Part::Inline {
                     inline_data: InlineData {
-                        mime_type: mime.to_string(),
-                        data: b64.to_string(),
+                        mime_type: Cow::Owned(mime.to_string()),
+                        data: Cow::Owned(b64.to_string()),
                     },
                 });
             }
         }
     }
     if parts.is_empty() {
-        parts.push(Part::text(content));
+        parts.push(Part::text(Cow::Borrowed(content)));
     }
     parts
 }
@@ -311,6 +316,27 @@ struct GeminiCliOAuthCreds {
     expiry_date: Option<i64>,
     /// RFC 3339 expiry string (used by older Gemini CLI versions).
     expiry: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadCodeAssistRequest<'a> {
+    #[serde(
+        rename = "cloudaicompanionProject",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cloudaicompanion_project: Option<&'a str>,
+    metadata: LoadCodeAssistMetadata<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadCodeAssistMetadata<'a> {
+    #[serde(rename = "ideType")]
+    ide_type: &'static str,
+    platform: &'static str,
+    #[serde(rename = "pluginType")]
+    plugin_type: &'static str,
+    #[serde(rename = "duetProject", skip_serializing_if = "Option::is_none")]
+    duet_project: Option<&'a str>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -869,18 +895,19 @@ impl GeminiProvider {
 
         // Call loadCodeAssist
         let client = self.http_client();
+        let load_request = LoadCodeAssistRequest {
+            cloudaicompanion_project: project_seed_for_request.as_deref(),
+            metadata: LoadCodeAssistMetadata {
+                ide_type: "GEMINI_CLI",
+                platform: "PLATFORM_UNSPECIFIED",
+                plugin_type: "GEMINI",
+                duet_project: duet_project_for_request.as_deref(),
+            },
+        };
         let response = client
             .post(LOAD_CODE_ASSIST_ENDPOINT)
             .bearer_auth(token)
-            .json(&serde_json::json!({
-                "cloudaicompanionProject": project_seed_for_request,
-                "metadata": {
-                    "ideType": "GEMINI_CLI",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                    "duetProject": duet_project_for_request,
-                }
-            }))
+            .json(&load_request)
             .send()
             .await?;
 
@@ -926,7 +953,7 @@ impl GeminiProvider {
         &self,
         auth: &GeminiAuth,
         url: &str,
-        request: &GenerateContentRequest,
+        request: &GenerateContentRequest<'_>,
         model: &str,
         include_generation_config: bool,
         project: Option<&str>,
@@ -940,13 +967,13 @@ impl GeminiProvider {
                 // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
                 let internal_request = InternalGenerateContentEnvelope {
                     model: Self::format_internal_model_name(model),
-                    project: project.map(|value| value.to_string()),
+                    project,
                     user_prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                     request: InternalGenerateContentRequest {
-                        contents: request.contents.clone(),
-                        system_instruction: request.system_instruction.clone(),
+                        contents: &request.contents,
+                        system_instruction: request.system_instruction.as_ref(),
                         generation_config: if include_generation_config {
-                            Some(request.generation_config.clone())
+                            Some(&request.generation_config)
                         } else {
                             None
                         },
@@ -985,8 +1012,8 @@ impl GeminiProvider {
 impl GeminiProvider {
     async fn send_generate_content(
         &self,
-        contents: Vec<Content>,
-        system_instruction: Option<Content>,
+        contents: Vec<Content<'_>>,
+        system_instruction: Option<Content<'_>>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
@@ -1223,7 +1250,7 @@ impl Provider for GeminiProvider {
         });
 
         let contents = vec![Content {
-            role: Some("user".to_string()),
+            role: Some(Cow::Borrowed("user")),
             parts: build_parts(message),
         }];
 
@@ -1250,14 +1277,14 @@ impl Provider for GeminiProvider {
                 }
                 "user" => {
                     contents.push(Content {
-                        role: Some("user".to_string()),
+                        role: Some(Cow::Borrowed("user")),
                         parts: build_parts(&msg.content),
                     });
                 }
                 "assistant" => {
                     // Gemini API uses "model" role instead of "assistant"
                     contents.push(Content {
-                        role: Some("model".to_string()),
+                        role: Some(Cow::Borrowed("model")),
                         parts: vec![Part::text(&msg.content)],
                     });
                 }
@@ -1270,7 +1297,7 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part::text(system_parts.join("\n\n"))],
+                parts: vec![Part::text(Cow::Owned(system_parts.join("\n\n")))],
             })
         };
 
@@ -1665,7 +1692,7 @@ mod tests {
     fn request_serialization() {
         let request = GenerateContentRequest {
             contents: vec![Content {
-                role: Some("user".to_string()),
+                role: Some(Cow::Borrowed("user")),
                 parts: vec![Part::text("Hello")],
             }],
             system_instruction: Some(Content {
@@ -1689,20 +1716,22 @@ mod tests {
 
     #[test]
     fn internal_request_includes_model() {
+        let contents = vec![Content {
+            role: Some(Cow::Borrowed("user")),
+            parts: vec![Part::text("Hello")],
+        }];
+        let generation_config = GenerationConfig {
+            temperature: 0.7,
+            max_output_tokens: 8192,
+        };
         let request = InternalGenerateContentEnvelope {
             model: "gemini-3-pro-preview".to_string(),
-            project: Some("test-project".to_string()),
+            project: Some("test-project"),
             user_prompt_id: Some("prompt-123".to_string()),
             request: InternalGenerateContentRequest {
-                contents: vec![Content {
-                    role: Some("user".to_string()),
-                    parts: vec![Part::text("Hello")],
-                }],
+                contents: &contents,
                 system_instruction: None,
-                generation_config: Some(GenerationConfig {
-                    temperature: 0.7,
-                    max_output_tokens: 8192,
-                }),
+                generation_config: Some(&generation_config),
             },
         };
 
@@ -1719,15 +1748,16 @@ mod tests {
 
     #[test]
     fn internal_request_omits_generation_config_when_none() {
+        let contents = vec![Content {
+            role: Some(Cow::Borrowed("user")),
+            parts: vec![Part::text("Hello")],
+        }];
         let request = InternalGenerateContentEnvelope {
             model: "gemini-3-pro-preview".to_string(),
-            project: Some("test-project".to_string()),
+            project: Some("test-project"),
             user_prompt_id: None,
             request: InternalGenerateContentRequest {
-                contents: vec![Content {
-                    role: Some("user".to_string()),
-                    parts: vec![Part::text("Hello")],
-                }],
+                contents: &contents,
                 system_instruction: None,
                 generation_config: None,
             },
@@ -1740,15 +1770,16 @@ mod tests {
 
     #[test]
     fn internal_request_includes_project() {
+        let contents = vec![Content {
+            role: Some(Cow::Borrowed("user")),
+            parts: vec![Part::text("Hello")],
+        }];
         let request = InternalGenerateContentEnvelope {
             model: "gemini-2.5-flash".to_string(),
-            project: Some("my-gcp-project-id".to_string()),
+            project: Some("my-gcp-project-id"),
             user_prompt_id: None,
             request: InternalGenerateContentRequest {
-                contents: vec![Content {
-                    role: Some("user".to_string()),
-                    parts: vec![Part::text("Hello")],
-                }],
+                contents: &contents,
                 system_instruction: None,
                 generation_config: None,
             },
@@ -2152,8 +2183,8 @@ mod tests {
     fn part_inline_serializes_as_inline_data_object() {
         let part = Part::Inline {
             inline_data: InlineData {
-                mime_type: "image/png".to_string(),
-                data: "iVBOR...".to_string(),
+                mime_type: Cow::Borrowed("image/png"),
+                data: Cow::Borrowed("iVBOR..."),
             },
         };
         let json = serde_json::to_value(&part).unwrap();
@@ -2177,13 +2208,13 @@ mod tests {
     #[test]
     fn content_with_mixed_parts_serializes_correctly() {
         let content = Content {
-            role: Some("user".to_string()),
+            role: Some(Cow::Borrowed("user")),
             parts: vec![
                 Part::text("Describe this image:"),
                 Part::Inline {
                     inline_data: InlineData {
-                        mime_type: "image/jpeg".to_string(),
-                        data: "/9j/4AAQ...".to_string(),
+                        mime_type: Cow::Borrowed("image/jpeg"),
+                        data: Cow::Borrowed("/9j/4AAQ..."),
                     },
                 },
             ],
