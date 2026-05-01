@@ -15,6 +15,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -514,9 +515,9 @@ impl OpenAiCompatibleProvider {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiChatRequest {
+struct ApiChatRequest<'a> {
     model: String,
-    messages: Vec<Message>,
+    messages: Vec<Message<'a>>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -533,15 +534,15 @@ struct ApiChatRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct Message {
-    role: String,
-    content: MessageContent,
+struct Message<'a> {
+    role: Cow<'a, str>,
+    content: MessageContent<'a>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum MessageContent {
-    Text(String),
+enum MessageContent<'a> {
+    Text(Cow<'a, str>),
     Parts(Vec<MessagePart>),
 }
 
@@ -716,9 +717,9 @@ struct Function {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest {
+struct NativeChatRequest<'a> {
     model: String,
-    messages: Vec<NativeMessage>,
+    messages: Vec<NativeMessage<'a>>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -735,18 +736,18 @@ struct NativeChatRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeMessage {
-    role: String,
+struct NativeMessage<'a> {
+    role: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<MessageContent>,
+    content: Option<MessageContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    tool_call_id: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     /// Raw reasoning content from thinking models; pass-through for providers
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1457,18 +1458,18 @@ impl OpenAiCompatibleProvider {
         })
     }
 
-    fn to_message_content(
+    fn to_message_content<'a>(
         role: &str,
-        content: &str,
+        content: &'a str,
         allow_user_image_parts: bool,
-    ) -> MessageContent {
+    ) -> MessageContent<'a> {
         if role != "user" || !allow_user_image_parts {
-            return MessageContent::Text(content.to_string());
+            return MessageContent::Text(Cow::Borrowed(content));
         }
 
         let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
         if image_refs.is_empty() {
-            return MessageContent::Text(content.to_string());
+            return MessageContent::Text(Cow::Borrowed(content));
         }
 
         let mut parts = Vec::with_capacity(image_refs.len() + 1);
@@ -1488,10 +1489,24 @@ impl OpenAiCompatibleProvider {
         MessageContent::Parts(parts)
     }
 
+    fn to_owned_message_content(
+        role: &str,
+        content: &str,
+        allow_user_image_parts: bool,
+    ) -> MessageContent<'static> {
+        match Self::to_message_content(role, content, allow_user_image_parts) {
+            MessageContent::Text(Cow::Borrowed(value)) => {
+                MessageContent::Text(Cow::Owned(value.to_string()))
+            }
+            MessageContent::Text(Cow::Owned(value)) => MessageContent::Text(Cow::Owned(value)),
+            MessageContent::Parts(parts) => MessageContent::Parts(parts),
+        }
+    }
+
     fn convert_messages_for_native(
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
-    ) -> Vec<NativeMessage> {
+    ) -> Vec<NativeMessage<'_>> {
         messages
             .iter()
             .map(|message| {
@@ -1520,15 +1535,15 @@ impl OpenAiCompatibleProvider {
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()));
+                        .map(|value| MessageContent::Text(Cow::Owned(value.to_string())));
 
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                        .map(|value| Cow::Owned(value.to_string()));
 
                     return NativeMessage {
-                        role: "assistant".to_string(),
+                        role: Cow::Borrowed("assistant"),
                         content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
@@ -1543,15 +1558,15 @@ impl OpenAiCompatibleProvider {
                     let tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                        .map(|value| Cow::Owned(value.to_string()));
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()))
-                        .or_else(|| Some(MessageContent::Text(message.content.clone())));
+                        .map(|value| MessageContent::Text(Cow::Owned(value.to_string())))
+                        .or_else(|| Some(MessageContent::Text(Cow::Borrowed(&message.content))));
 
                     return NativeMessage {
-                        role: "tool".to_string(),
+                        role: Cow::Borrowed("tool"),
                         content,
                         tool_call_id,
                         tool_calls: None,
@@ -1560,7 +1575,7 @@ impl OpenAiCompatibleProvider {
                 }
 
                 NativeMessage {
-                    role: message.role.clone(),
+                    role: Cow::Borrowed(&message.role),
                     content: Some(Self::to_message_content(
                         &message.role,
                         &message.content,
@@ -1755,18 +1770,18 @@ impl Provider for OpenAiCompatibleProvider {
                 None => message.to_string(),
             };
             messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                role: Cow::Borrowed("user"),
+                content: Self::to_owned_message_content("user", &content, !merge),
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
-                    role: "system".to_string(),
-                    content: MessageContent::Text(sys.to_string()),
+                    role: Cow::Borrowed("system"),
+                    content: MessageContent::Text(Cow::Borrowed(sys)),
                 });
             }
             messages.push(Message {
-                role: "user".to_string(),
+                role: Cow::Borrowed("user"),
                 content: Self::to_message_content("user", message, true),
             });
         }
@@ -1875,7 +1890,7 @@ impl Provider for OpenAiCompatibleProvider {
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
-                role: m.role.clone(),
+                role: Cow::Borrowed(&m.role),
                 content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
@@ -1975,7 +1990,7 @@ impl Provider for OpenAiCompatibleProvider {
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
-                role: m.role.clone(),
+                role: Cow::Borrowed(&m.role),
                 content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
@@ -2238,7 +2253,7 @@ impl Provider for OpenAiCompatibleProvider {
             let messages = effective_messages
                 .iter()
                 .map(|message| Message {
-                    role: message.role.clone(),
+                    role: Cow::Borrowed(&message.role),
                     content: Self::to_message_content(&message.role, &message.content, !merge),
                 })
                 .collect();
@@ -2333,19 +2348,19 @@ impl Provider for OpenAiCompatibleProvider {
                 None => message.to_string(),
             };
             messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                role: Cow::Borrowed("user"),
+                content: Self::to_owned_message_content("user", &content, !merge),
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
-                    role: "system".to_string(),
-                    content: MessageContent::Text(sys.to_string()),
+                    role: Cow::Borrowed("system"),
+                    content: MessageContent::Text(Cow::Owned(sys.to_string())),
                 });
             }
             messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", message, !merge),
+                role: Cow::Borrowed("user"),
+                content: Self::to_owned_message_content("user", message, !merge),
             });
         }
 
@@ -2432,8 +2447,8 @@ impl Provider for OpenAiCompatibleProvider {
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
+                role: Cow::Owned(m.role.clone()),
+                content: Self::to_owned_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
@@ -2559,12 +2574,12 @@ mod tests {
             model: "llama-3.3-70b".to_string(),
             messages: vec![
                 Message {
-                    role: "system".to_string(),
-                    content: MessageContent::Text("You are ZeroClaw".to_string()),
+                    role: Cow::Borrowed("system"),
+                    content: MessageContent::Text(Cow::Borrowed("You are ZeroClaw")),
                 },
                 Message {
-                    role: "user".to_string(),
-                    content: MessageContent::Text("hello".to_string()),
+                    role: Cow::Borrowed("user"),
+                    content: MessageContent::Text(Cow::Borrowed("hello")),
                 },
             ],
             temperature: 0.4,
@@ -3565,8 +3580,8 @@ mod tests {
         let req = ApiChatRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("What is the weather?".to_string()),
+                role: Cow::Borrowed("user"),
+                content: MessageContent::Text(Cow::Borrowed("What is the weather?")),
             }],
             temperature: 0.7,
             stream: Some(false),
@@ -3588,8 +3603,8 @@ mod tests {
         let req = ApiChatRequest {
             model: "glm-5".to_string(),
             messages: vec![Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("List /tmp".to_string()),
+                role: Cow::Borrowed("user"),
+                content: MessageContent::Text(Cow::Borrowed("List /tmp")),
             }],
             temperature: 0.7,
             stream: Some(false),
@@ -3622,8 +3637,8 @@ mod tests {
         let req = ApiChatRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("List /tmp".to_string()),
+                role: Cow::Borrowed("user"),
+                content: MessageContent::Text(Cow::Borrowed("List /tmp")),
             }],
             temperature: 0.7,
             stream: Some(false),
@@ -4106,8 +4121,8 @@ mod tests {
     fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
         // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
         let msg_without = NativeMessage {
-            role: "assistant".to_string(),
-            content: Some(MessageContent::Text("hi".to_string())),
+            role: Cow::Borrowed("assistant"),
+            content: Some(MessageContent::Text(Cow::Borrowed("hi"))),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -4119,11 +4134,11 @@ mod tests {
         );
 
         let msg_with = NativeMessage {
-            role: "assistant".to_string(),
-            content: Some(MessageContent::Text("hi".to_string())),
+            role: Cow::Borrowed("assistant"),
+            content: Some(MessageContent::Text(Cow::Borrowed("hi"))),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: Some("thinking...".to_string()),
+            reasoning_content: Some(Cow::Borrowed("thinking...")),
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
