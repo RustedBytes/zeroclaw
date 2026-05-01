@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use reqwest::Body;
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -519,7 +520,7 @@ pub struct TelegramChannel {
     bot_token: String,
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<PairingGuard>,
-    client: reqwest::Client,
+    client: Mutex<reqwest::Client>,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
@@ -583,7 +584,7 @@ impl TelegramChannel {
             bot_token,
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
-            client: Self::build_http_client(None),
+            client: Mutex::new(Self::build_http_client(None)),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -620,7 +621,7 @@ impl TelegramChannel {
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
-        self.client = Self::build_http_client(proxy_url.as_deref());
+        self.client = Mutex::new(Self::build_http_client(proxy_url.as_deref()));
         self.proxy_url = proxy_url;
         self
     }
@@ -652,6 +653,7 @@ impl TelegramChannel {
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
+        self.client = Mutex::new(Self::build_http_client(self.proxy_url.as_deref()));
         self
     }
 
@@ -736,10 +738,17 @@ impl TelegramChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        self.client.clone()
+        self.client.lock().clone()
     }
 
     fn build_http_client(proxy_url: Option<&str>) -> reqwest::Client {
+        Self::build_http_client_with_resolved_addrs(proxy_url, None)
+    }
+
+    fn build_http_client_with_resolved_addrs(
+        proxy_url: Option<&str>,
+        resolved: Option<(&str, &[SocketAddr])>,
+    ) -> reqwest::Client {
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(TELEGRAM_CONNECT_TIMEOUT_SECS))
@@ -753,10 +762,57 @@ impl TelegramChannel {
         )
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(600));
+        let builder = if let Some((domain, addrs)) = resolved {
+            builder.resolve_to_addrs(domain, addrs)
+        } else {
+            builder
+        };
         builder.build().unwrap_or_else(|error| {
             tracing::warn!("Failed to build Telegram HTTP client: {error}");
             reqwest::Client::new()
         })
+    }
+
+    fn api_base_host_port(&self) -> Option<(String, u16)> {
+        let url = reqwest::Url::parse(&self.api_base).ok()?;
+        let host = url.host_str()?.to_string();
+        let port = url.port_or_known_default()?;
+        Some((host, port))
+    }
+
+    async fn refresh_http_client_with_resolved_api_host(&self) {
+        if self.proxy_url.is_some() {
+            return;
+        }
+
+        let Some((host, port)) = self.api_base_host_port() else {
+            return;
+        };
+        let lookup = tokio::net::lookup_host((host.as_str(), port)).await;
+        match lookup {
+            Ok(addrs) => {
+                let addrs = addrs.collect::<Vec<_>>();
+                if addrs.is_empty() {
+                    return;
+                }
+                let client = Self::build_http_client_with_resolved_addrs(
+                    self.proxy_url.as_deref(),
+                    Some((&host, &addrs)),
+                );
+                *self.client.lock() = client;
+                tracing::info!(
+                    host,
+                    resolved_addrs = addrs.len(),
+                    "Telegram HTTP client pinned startup DNS resolution"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    host,
+                    "Telegram startup DNS resolution failed; using system resolver: {error}"
+                );
+            }
+        }
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -3242,6 +3298,7 @@ impl Channel for TelegramChannel {
         }
 
         tracing::info!("Telegram channel listening for messages...");
+        self.refresh_http_client_with_resolved_api_host().await;
 
         // Startup probe: claim the getUpdates slot before entering the long-poll loop.
         // A previous daemon's 30-second poll may still be active on Telegram's server.

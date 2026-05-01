@@ -830,6 +830,42 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// POST /api/runtime/reset — reset process-local runtime state after container restore.
+pub async fn handle_api_runtime_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    zeroclaw_config::schema::clear_runtime_proxy_client_cache();
+
+    let provider_warmup = match state.provider.warmup().await {
+        Ok(()) => {
+            tracing::info!("Runtime reset completed; provider warmup succeeded");
+            serde_json::json!({ "ok": true })
+        }
+        Err(error) => {
+            let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+            tracing::warn!("Runtime reset completed; provider warmup failed: {error}");
+            serde_json::json!({
+                "ok": false,
+                "error": error,
+            })
+        }
+    };
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "reset": {
+            "runtime_http_client_cache": "cleared",
+            "provider_warmup": provider_warmup,
+        }
+    }))
+    .into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -1762,6 +1798,22 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_clears_http_cache_and_warms_provider() {
+        let response = handle_api_runtime_reset(
+            State(test_state(zeroclaw_config::schema::Config::default())),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["reset"]["runtime_http_client_cache"], "cleared");
+        assert_eq!(body["reset"]["provider_warmup"]["ok"], true);
     }
 
     #[test]
