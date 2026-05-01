@@ -266,7 +266,11 @@ impl ResponseCache {
 
     /// Wipe the entire cache (useful for `zeroclaw cache clear`).
     pub fn clear(&self) -> Result<usize> {
-        self.hot_cache.lock().clear();
+        let mut hot_cache = self.hot_cache.lock();
+        hot_cache.clear();
+        hot_cache.shrink_to(0);
+        drop(hot_cache);
+
         let conn = self.conn.lock();
         let affected = conn.execute("DELETE FROM response_cache", [])?;
         Ok(affected)
@@ -413,6 +417,7 @@ mod tests {
 
         let (count, _, _) = cache.stats().unwrap();
         assert_eq!(count, 0);
+        assert_eq!(cache.hot_cache.lock().capacity(), 0);
     }
 
     #[test]

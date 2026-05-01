@@ -339,6 +339,7 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.history.shrink_to(0);
     }
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {

@@ -128,6 +128,7 @@ pub fn emergency_history_trim(
         }
     }
     dropped += remove_orphaned_tool_messages(history);
+    shrink_history_after_large_trim(history);
     dropped
 }
 
@@ -162,6 +163,15 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
     remove_orphaned_tool_messages(history);
+    shrink_history_after_large_trim(history);
+}
+
+fn shrink_history_after_large_trim(history: &mut Vec<ChatMessage>) {
+    let len = history.len();
+    let shrink_threshold = len.saturating_mul(2).max(DEFAULT_MAX_HISTORY_MESSAGES);
+    if history.capacity() > shrink_threshold {
+        history.shrink_to(len);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,4 +224,27 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_history_releases_excess_capacity_after_large_trim() {
+        let mut history = Vec::with_capacity(1024);
+        history.push(ChatMessage::system("system"));
+        for i in 0..128 {
+            history.push(ChatMessage::user(format!("message {i}")));
+        }
+
+        let capacity_before = history.capacity();
+        trim_history(&mut history, 4);
+
+        assert_eq!(history.len(), 5);
+        assert!(
+            history.capacity() < capacity_before,
+            "trim_history should release oversized backing storage"
+        );
+    }
 }
