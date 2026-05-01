@@ -13536,28 +13536,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "portable-atomic",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
 name = "zeroclaw-runtime"
 version = "0.7.3"
 dependencies = [

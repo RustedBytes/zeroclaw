@@ -44,7 +44,6 @@ COPY Cargo.toml Cargo.lock ./
 # aardvark-sys has an implicit build script (build.rs at its crate root) that
 # Cargo must compile during the dependency pre-fetch step; copy it explicitly.
 COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
-COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
 COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
 COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml

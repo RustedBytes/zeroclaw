@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
@@ -14,15 +14,15 @@ rust-version = "1.87"
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
 zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3", default-features = false }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3", default-features = false }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3", default-features = false }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3", default-features = false }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3", default-features = false }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3", default-features = false }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3", default-features = false }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
@@ -237,11 +237,10 @@ mime_guess = { version = "2", optional = true }
 libc = "0.2"
 
 [features]
-default = [
+default = []
+full = [
     "agent-runtime",
     "gateway",
-    "tui-onboarding",
-    "observability-prometheus",
     "schema-export",
 ]
 
@@ -252,7 +251,6 @@ agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
-    "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
