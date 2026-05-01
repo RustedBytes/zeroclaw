@@ -4565,7 +4565,20 @@ pub fn apply_runtime_proxy_to_builder(
     builder: reqwest::ClientBuilder,
     service_key: &str,
 ) -> reqwest::ClientBuilder {
+    let builder = apply_checkpoint_resilient_http_defaults(builder);
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+/// Apply outbound HTTP defaults that keep long-running daemon clients robust
+/// across process checkpoint/restore.
+///
+/// CRIU-style restores can leave pooled TCP/TLS connections looking reusable to
+/// the process even though the peer/network path has moved on. Keeping no idle
+/// connections avoids repeatedly retrying against stale restored sockets.
+pub fn apply_checkpoint_resilient_http_defaults(
+    builder: reqwest::ClientBuilder,
+) -> reqwest::ClientBuilder {
+    builder.pool_max_idle_per_host(0)
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
@@ -4704,6 +4717,7 @@ fn apply_explicit_proxy_to_builder(
     service_key: &str,
     proxy_url: &str,
 ) -> reqwest::ClientBuilder {
+    builder = apply_checkpoint_resilient_http_defaults(builder);
     match reqwest::Proxy::all(proxy_url) {
         Ok(proxy) => {
             builder = builder.proxy(proxy);

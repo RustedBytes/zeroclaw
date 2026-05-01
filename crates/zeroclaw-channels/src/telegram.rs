@@ -658,6 +658,7 @@ impl TelegramChannel {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
+                    let err = zeroclaw_providers::sanitize_api_error(&err.to_string());
                     tracing::warn!(
                         "Telegram: failed to add ACK reaction to chat_id={chat_id}, message_id={message_id}: {err}"
                     );
@@ -768,6 +769,10 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    fn sanitize_http_error(error: &impl std::fmt::Display) -> String {
+        zeroclaw_providers::sanitize_api_error(&error.to_string())
+    }
+
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
     /// Called once at startup so that users see a command menu when pressing `/`.
     /// Includes built-in runtime commands, user-installed skill commands, and
@@ -860,7 +865,8 @@ impl TelegramChannel {
                 tracing::warn!("Failed to register Telegram bot commands: {status} — {text}");
             }
             Err(e) => {
-                tracing::warn!("Failed to register Telegram bot commands: {e}");
+                let error = Self::sanitize_http_error(&e);
+                tracing::warn!("Failed to register Telegram bot commands: {error}");
             }
         }
     }
@@ -3234,7 +3240,8 @@ impl Channel for TelegramChannel {
             let resp = match self.http_client().post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("Telegram poll error: {e}");
+                    let error = Self::sanitize_http_error(&e);
+                    tracing::warn!("Telegram poll error: {error}");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -3425,7 +3432,8 @@ Ensure only one `zeroclaw` process is using this bot token."
         {
             Ok(Ok(resp)) => resp.status().is_success(),
             Ok(Err(e)) => {
-                tracing::debug!("Telegram health check failed: {e}");
+                let error = Self::sanitize_http_error(&e);
+                tracing::debug!("Telegram health check failed: {error}");
                 false
             }
             Err(_) => {

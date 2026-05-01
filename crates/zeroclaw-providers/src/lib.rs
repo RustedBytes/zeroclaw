@@ -797,10 +797,27 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+fn redact_prefixed_value(input: &mut String, prefix: &str) {
+    let mut search_from = 0;
+    while let Some(rel) = input[search_from..].find(prefix) {
+        let start = search_from + rel;
+        let content_start = start + prefix.len();
+        let end = token_end(input, content_start);
+
+        if end == content_start {
+            search_from = content_start;
+            continue;
+        }
+
+        input.replace_range(content_start..end, "[REDACTED]");
+        search_from = content_start + "[REDACTED]".len();
+    }
+}
+
 /// Scrub known secret-like token prefixes from provider error strings.
 ///
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, plus API keys embedded in provider URLs.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const PREFIXES: [&str; 7] = [
         "sk-",
@@ -831,6 +848,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
             search_from = start + "[REDACTED]".len();
         }
     }
+
+    redact_prefixed_value(&mut scrubbed, "key=");
+    redact_prefixed_value(&mut scrubbed, "api_key=");
+    redact_prefixed_value(&mut scrubbed, "/bot");
 
     scrubbed
 }
@@ -3561,6 +3582,22 @@ mod tests {
         let result = sanitize_api_error(input);
         assert!(!result.contains("xoxb-abc123"));
         assert!(result.contains("};"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_url_query_api_key() {
+        let input = "error sending request for url (https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent?key=AIzaSySecretValue)";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSySecretValue"));
+        assert!(result.contains("key=[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_telegram_bot_token_in_url() {
+        let input = "error sending request for url (https://api.telegram.org/bot123456:ABC-Secret/setMessageReaction)";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("123456:ABC-Secret"));
+        assert!(result.contains("/bot[REDACTED]/setMessageReaction"));
     }
 
     #[test]
